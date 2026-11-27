@@ -42,6 +42,7 @@ This repository is a thin layer of scripts and engine patches. Its own work is l
 - **[Zig](https://ziglang.org)** by the Zig Software Foundation and contributors.
 - **NVIDIA**: the CUDA containers (`nvidia/cuda:13.3.1-devel-ubuntu24.04` / `runtime`) the image is based on, and Model Optimizer
   (the checkpoint's format).
+- **plotarmordev** ([plotarmordev](https://github.com/plotarmordev)): fused prompt loop `gate_prep` into `tf_ink2_loop_gate_down_rows` and direct consumer-plane stores from fused prompt attention projections ([PR #6](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold/pull/6), integrated in patch `0028` with `tf_ck8_128_row_split`), and widening prompt chunks from 4,096 to 8,192 rows ([PR #7](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold/pull/7), integrated in patch `0029`).
 - **[Basalt](https://github.com/jesdga95/basalt)** by [jesdga95](https://github.com/jesdga95): Blackwell `sm_120` Inkling 2 Mini prefill and chunking ideas.
 
 ## Recipe & Patches
