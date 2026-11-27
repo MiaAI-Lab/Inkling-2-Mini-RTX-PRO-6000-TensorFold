@@ -1,0 +1,44 @@
+From 34ab05a8eb6114a074df18ec6f71516b9abfc859 Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:28:42 +0200
+Subject: [PATCH] inkling2: widen prompt chunks from 4096 to 8192 rows (after
+ PR #7)
+
+Widen prompt_rows and prompt_rows_max from 4096 to 8192 (after
+plotarmordev PR #7), handling ~4k prompts in a single pass and halving
+full-model weight streaming on 8k-128k prefills while retaining the full
+16.0 GiB prompt cache at 262144 x 8 fp8 KV.
+---
+ zig/src/families/inkling2/kernels.zig    | 2 +-
+ zig/src/families/inkling2/mini_model.zig | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 544132dc7..7667a4662 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -411,7 +411,7 @@ pub fn attend(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, stride: u32,
+ const S_check = struct {
+     var on: bool = true;
+ };
+-const prompt_rows_max = 4096;
++const prompt_rows_max = 8192;
+ 
+ /// One stream's rows from which a sliding call takes tf_ink2_attn_slide (prompt passes).
+ pub const slide_rows = 64;
+diff --git a/zig/src/families/inkling2/mini_model.zig b/zig/src/families/inkling2/mini_model.zig
+index fbda9cd3b..785c243b9 100644
+--- a/zig/src/families/inkling2/mini_model.zig
++++ b/zig/src/families/inkling2/mini_model.zig
+@@ -13,7 +13,7 @@ const mini_vision = @import("mini_vision.zig");
+ const DeviceBuffer = cuda.DeviceBuffer;
+ 
+ /// Prompt rows a forward takes at most: one stream's chunk.
+-pub const prompt_rows = 4096;
++pub const prompt_rows = 8192;
+ 
+ const WideGraphKey = struct {
+     rows: u16,
+-- 
+2.43.0
+

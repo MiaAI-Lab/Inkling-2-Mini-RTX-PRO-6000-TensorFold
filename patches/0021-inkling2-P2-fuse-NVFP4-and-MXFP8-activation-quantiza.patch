@@ -1,0 +1,383 @@
+From 5f88deac19c725be24cf6ca0be7a30b02a92babb Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:59:01 +0200
+Subject: [PATCH] inkling2: P2 fuse NVFP4 and MXFP8 activation quantization
+ into TC prompt up epilogue (TF_INKLING2_PREFILL_TC_FUSED_Q)
+
+---
+ zig/kernels/cuda/fp8_experts.cu          | 68 +++++++++++++++++++--
+ zig/kernels/cuda/nvfp4_experts.cu        | 75 +++++++++++++++++++++---
+ zig/src/cuda/experts_mx.zig              | 69 ++++++++++++++++++++--
+ zig/src/families/inkling2/mini_visit.zig | 26 ++++++--
+ 4 files changed, 217 insertions(+), 21 deletions(-)
+
+diff --git a/zig/kernels/cuda/fp8_experts.cu b/zig/kernels/cuda/fp8_experts.cu
+index 30a5a82e9..2e2d92cfd 100644
+--- a/zig/kernels/cuda/fp8_experts.cu
++++ b/zig/kernels/cuda/fp8_experts.cu
+@@ -491,12 +491,13 @@ __device__ __forceinline__ void mma_mxfp8(float (&)[4], const uint32_t (&)[4], u
+ #endif
+ 
+ // Pre-quantized MXFP8 prompt rows on Blackwell native MXFP8 block-scaled tensor cores (sm_120a / sm_121a).
+-template <int M, int EPI, int RT, int CW>
++template <int M, int EPI, int RT, int CW, bool QUANT_OUT = false>
+ __device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                  int x_stride, int slots, const uint4* __restrict__ W, int KG, int NB,
+                                                  const int* __restrict__ items, const int* __restrict__ counts,
+                                                  const int* __restrict__ members, void* __restrict__ out, int N,
+-                                                 float cap0, float cap1, int skip) {
++                                                 float cap0, float cap1, int skip,
++                                                 uint8_t* __restrict__ out_sc = nullptr) {
+   static_assert((PWARPS / CW) * RT * 16 == 64, "a prompt item holds 64 pairs");
+   __shared__ uint4 sw[PSTAGES][CW][M * MXB];
+   __shared__ uint4 sx[PSTAGES][64][2];
+@@ -587,8 +588,57 @@ __device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc,
+     cp_wait<0>();
+     if (live) {
+ #pragma unroll
+-      for (int r = 0; r < RT; ++r)
+-        epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], cap0, cap1);
++      for (int r = 0; r < RT; ++r) {
++        if constexpr (QUANT_OUT && EPI == 4 && M == 2) {
++          const int kb = N >> 5;
++#pragma unroll
++          for (int h = 0; h < 2; ++h) {
++            const bool live_h = h ? v1[r] : v0[r];
++            const int row = h ? pr1[r] : pr0[r];
++            float vf[4][2];
++            float amax = 0.f;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++              const float a0 = acc[0][r][j][2 * h], a1 = acc[0][r][j][2 * h + 1];
++              const float u0 = acc[1][r][j][2 * h], u1 = acc[1][r][j][2 * h + 1];
++              float o0, o1;
++              if (cap1 < 0.f) {
++                o0 = softcap_swiglu(bf(a0), bf(u0), cap0, -cap1);
++                o1 = softcap_swiglu(bf(a1), bf(u1), cap0, -cap1);
++              } else {
++                o0 = softcap_swiglu(a0, u0, cap0, cap1);
++                o1 = softcap_swiglu(a1, u1, cap0, cap1);
++              }
++              vf[j][0] = bf(o0);
++              vf[j][1] = bf(o1);
++              amax = fmaxf(amax, fmaxf(fabsf(vf[j][0]), fabsf(vf[j][1])));
++            }
++            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
++            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
++            uint32_t ue = 127u;
++            float inv = 1.f;
++            if (amax > 0.f) {
++              const uint32_t u = __float_as_uint(amax * (1.f / 448.f));
++              ue = ((u >> 23) & 0xFFu) + ((u & 0x7FFFFFu) != 0u ? 1u : 0u);
++              if (ue < 1u) ue = 1u;
++              if (ue > 254u) ue = 254u;
++              inv = __uint_as_float((254u - ue) << 23);
++            }
++            if (live_h) {
++              uint8_t* dst = reinterpret_cast<uint8_t*>(out) + static_cast<size_t>(row) * N + cb * 32;
++#pragma unroll
++              for (int j = 0; j < 4; ++j) {
++                const uint32_t b0 = __nv_cvt_float_to_fp8(vf[j][0] * inv, __NV_SATFINITE, __NV_E4M3);
++                const uint32_t b1 = __nv_cvt_float_to_fp8(vf[j][1] * inv, __NV_SATFINITE, __NV_E4M3);
++                *reinterpret_cast<uint16_t*>(dst + j * 8 + 2 * t) = static_cast<uint16_t>(b0 | (b1 << 8));
++              }
++              if (t == 0) out_sc[static_cast<size_t>(row) * kb + cb] = static_cast<uint8_t>(ue);
++            }
++          }
++        } else {
++          epilogue<EPI, M, RT>(acc, r, out, N, cb * COLS + 2 * t, pr0[r], pr1[r], v0[r], v1[r], cap0, cap1);
++        }
++      }
+     }
+   }
+ }
+@@ -664,3 +714,13 @@ TF_MX_ENTRY(tf_mxfp8_prompt_down, prompt_body<TF_MX_ARGS(1, 3, 4, 4)>)
+   }
+ TF_MX_TCQ(tf_mxfp8_prompt_softcap_tc_q, prompt_body_tc_q<TF_MX_ARGS(2, 4, 2, 2)>)
+ TF_MX_TCQ(tf_mxfp8_prompt_down_tc_q, prompt_body_tc_q<TF_MX_ARGS(1, 3, 4, 4)>)
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_mxfp8_prompt_softcap_tc_qq(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                                  int slots, const uint4* __restrict__ W, int KG, int NB,
++                                  const int* __restrict__ items, const int* __restrict__ counts,
++                                  const int* __restrict__ members, void* __restrict__ out_codes,
++                                  uint8_t* __restrict__ out_scales, int N, float cap0, float cap1, int skip) {
++  tf_mxfp8_experts::prompt_body_tc_q<2, 4, 2, 2, true>(xc, xsc, x_stride, slots, W, KG, NB, items, counts, members,
++                                                       out_codes, N, cap0, cap1, skip, out_scales);
++}
+diff --git a/zig/kernels/cuda/nvfp4_experts.cu b/zig/kernels/cuda/nvfp4_experts.cu
+index 584347d4e..9756b03cc 100644
+--- a/zig/kernels/cuda/nvfp4_experts.cu
++++ b/zig/kernels/cuda/nvfp4_experts.cu
+@@ -586,12 +586,13 @@ struct Prompt4Q {
+   static constexpr int STAGES = SU * 16 * 4 <= 49152 ? 4 : SU * 16 * 3 <= 49152 ? 3 : 2;
+ };
+ 
+-template <int M, int EPI, int RT, int WM, int WN, int NT>
++template <int M, int EPI, int RT, int WM, int WN, int NT, bool QUANT_OUT = false>
+ __device__ __forceinline__ void prompt_tiles_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                   int x_stride, int slots, const uint4* __restrict__ W,
+                                                   const float* __restrict__ scale, int KG, int NB,
+                                                   const int* __restrict__ members, void* __restrict__ out, int N,
+-                                                  float limit, int cbt, int e, int first, int cnt, float limit2 = 0.f) {
++                                                  float limit, int cbt, int e, int first, int cnt, float limit2 = 0.f,
++                                                  uint8_t* __restrict__ out_sc = nullptr) {
+   using P = Prompt4Q<M, RT, WM, WN>;
+   constexpr int STAGES = P::STAGES;
+   extern __shared__ uint4 sm[];
+@@ -712,18 +713,68 @@ __device__ __forceinline__ void prompt_tiles_tc_q(const uint8_t* __restrict__ xc
+       const int m0 = base + 16 * r + gq, m1 = m0 + 8;
+       const bool v0 = m0 < cnt, v1 = m1 < cnt;
+       const int p0 = v0 ? __ldg(members + first + m0) : 0, p1 = v1 ? __ldg(members + first + m1) : 0;
+-      epilogue<EPI, M, TA>(acc, r, out, N, cb * COLS + 2 * t, p0, p1, v0, v1, limit, limit2);
++      if constexpr (QUANT_OUT && EPI == 4 && M == 2) {
++        const int kb = N >> 4;
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++          const bool live_h = h ? v1 : v0;
++          const int row = h ? p1 : p0;
++          float vf[4][2];
++#pragma unroll
++          for (int j = 0; j < 4; ++j) {
++            const float a0 = acc[0][r][j][2 * h], a1 = acc[0][r][j][2 * h + 1];
++            const float u0 = acc[1][r][j][2 * h], u1 = acc[1][r][j][2 * h + 1];
++            float o0, o1;
++            if (limit2 < 0.f) {
++              o0 = softcap_swiglu(bf(a0), bf(u0), limit, -limit2);
++              o1 = softcap_swiglu(bf(a1), bf(u1), limit, -limit2);
++            } else {
++              o0 = softcap_swiglu(a0, u0, limit, limit2);
++              o1 = softcap_swiglu(a1, u1, limit, limit2);
++            }
++            vf[j][0] = bf(o0);
++            vf[j][1] = bf(o1);
++          }
++#pragma unroll
++          for (int b = 0; b < 2; ++b) {
++            const int j0 = 2 * b, j1 = 2 * b + 1;
++            float amax = fmaxf(fmaxf(fabsf(vf[j0][0]), fabsf(vf[j0][1])), fmaxf(fabsf(vf[j1][0]), fabsf(vf[j1][1])));
++            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
++            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
++            const nvfp4q::Scale sc = nvfp4q::block_scale(amax, 1.0f);
++            const uint32_t b0 = nvfp4q::e2m1(vf[j0][0] * sc.mul) | (nvfp4q::e2m1(vf[j0][1] * sc.mul) << 4);
++            const uint32_t b1 = nvfp4q::e2m1(vf[j1][0] * sc.mul) | (nvfp4q::e2m1(vf[j1][1] * sc.mul) << 4);
++            const uint32_t w0 = __shfl_sync(0xffffffffu, b0, gq * 4 + 0) |
++                                (__shfl_sync(0xffffffffu, b0, gq * 4 + 1) << 8) |
++                                (__shfl_sync(0xffffffffu, b0, gq * 4 + 2) << 16) |
++                                (__shfl_sync(0xffffffffu, b0, gq * 4 + 3) << 24);
++            const uint32_t w1 = __shfl_sync(0xffffffffu, b1, gq * 4 + 0) |
++                                (__shfl_sync(0xffffffffu, b1, gq * 4 + 1) << 8) |
++                                (__shfl_sync(0xffffffffu, b1, gq * 4 + 2) << 16) |
++                                (__shfl_sync(0xffffffffu, b1, gq * 4 + 3) << 24);
++            if (live_h && t == 0) {
++              const int blk = cb * 2 + b;
++              *reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(out) + static_cast<size_t>(row) * (N >> 1) +
++                                        blk * 8) = make_uint2(w0, w1);
++              out_sc[static_cast<size_t>(row) * kb + blk] = static_cast<uint8_t>(sc.sf8);
++            }
++          }
++        }
++      } else {
++        epilogue<EPI, M, TA>(acc, r, out, N, cb * COLS + 2 * t, p0, p1, v0, v1, limit, limit2);
++      }
+     }
+   }
+ }
+ 
+-template <int M, int EPI, int RT, int WM, int WN>
++template <int M, int EPI, int RT, int WM, int WN, bool QUANT_OUT = false>
+ __device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc,
+                                                  int x_stride, int slots, const uint4* __restrict__ W,
+                                                  const float* __restrict__ scale, int KG, int NB,
+                                                  const int* __restrict__ items, const int* __restrict__ counts,
+                                                  const int* __restrict__ members, void* __restrict__ out, int N,
+-                                                 float limit, int skip, float limit2 = 0.f) {
++                                                 float limit, int skip, float limit2 = 0.f,
++                                                 uint8_t* __restrict__ out_sc = nullptr) {
+   static_assert(RT == 4, "the dispatch below spells out 0 .. 4 row tiles");
+   const int nbt = (NB + WN - 1) / WN, it = blockIdx.x / nbt, cbt = blockIdx.x - it * nbt;
+   if (it >= __ldg(counts)) return;
+@@ -731,8 +782,8 @@ __device__ __forceinline__ void prompt_body_tc_q(const uint8_t* __restrict__ xc,
+   if (e == skip) return;
+   const int nt = max(0, min(RT, (cnt - 16 * RT * ((threadIdx.x >> 5) / WN) + 15) >> 4));
+ #define TF_TILES_TCQ(NT) \
+-  prompt_tiles_tc_q<M, EPI, RT, WM, WN, NT>(xc, xsc, x_stride, slots, W, scale, KG, NB, members, out, N, limit, cbt, \
+-                                            e, first, cnt, limit2)
++  prompt_tiles_tc_q<M, EPI, RT, WM, WN, NT, QUANT_OUT>(xc, xsc, x_stride, slots, W, scale, KG, NB, members, out, N, \
++                                                       limit, cbt, e, first, cnt, limit2, out_sc)
+   switch (nt) {
+     case 4: TF_TILES_TCQ(4); break;
+     case 3: TF_TILES_TCQ(3); break;
+@@ -839,6 +890,16 @@ extern "C" __global__ void __launch_bounds__(128)
+                                                     out, N, gate_cap, skip, up_cap);
+ }
+ 
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_prompt_softcap_tc_qq(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride,
++                                  int slots, const uint4* __restrict__ W, const float* __restrict__ scale, int KG,
++                                  int NB, const int* __restrict__ items, const int* __restrict__ counts,
++                                  const int* __restrict__ members, void* __restrict__ out_codes,
++                                  uint8_t* __restrict__ out_scales, int N, float gate_cap, float up_cap, int skip) {
++  tf_nvfp4_experts::prompt_body_tc_q<2, 4, 4, 1, 4, true>(xc, xsc, x_stride, slots, W, scale, KG, NB, items, counts,
++                                                          members, out_codes, N, gate_cap, skip, up_cap, out_scales);
++}
++
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_nvfp4_prompt_down_tc_q(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xsc, int x_stride, int slots,
+                               const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
+diff --git a/zig/src/cuda/experts_mx.zig b/zig/src/cuda/experts_mx.zig
+index e03b5cf77..e21009bbd 100644
+--- a/zig/src/cuda/experts_mx.zig
++++ b/zig/src/cuda/experts_mx.zig
+@@ -83,12 +83,23 @@ pub fn prefillTcMode() u8 {
+     return S.v.?;
+ }
+ 
++/// TF_INKLING2_PREFILL_TC_FUSED_Q=0: disable P2 fused activation quantization in the TC up epilogue.
++pub fn prefillTcFusedQ() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) {
++        S.v = if (std.c.getenv("TF_INKLING2_PREFILL_TC_FUSED_Q")) |e| e[0] != '0' else true;
++    }
++    return S.v.?;
++}
++
+ /// nvfp4_experts.cu's soft-capped SwiGLU gate-up: decode units of 4 warps, and the prompt tiles of 4 warps.
+ pub const Softcap = struct {
+-    fns: [3]Function = undefined, // decode, prompt, prompt_tc_q
++    fns: [4]Function = undefined, // decode, prompt, prompt_tc_q, prompt_tc_qq
+     resident: usize = 0,
+ 
+-    pub const symbols = [3][:0]const u8{ "tf_nvfp4_softcap", "tf_nvfp4_prompt_softcap", "tf_nvfp4_prompt_softcap_tc_q" };
++    pub const symbols = [4][:0]const u8{ "tf_nvfp4_softcap", "tf_nvfp4_prompt_softcap", "tf_nvfp4_prompt_softcap_tc_q", "tf_nvfp4_prompt_softcap_tc_qq" };
+     pub const prompt_wn = 4;
+ 
+     pub fn resolve(mod: Module, sms: usize) !Softcap {
+@@ -96,6 +107,7 @@ pub const Softcap = struct {
+         for (symbols, &c.fns) |name, *f| f.* = try mod.function(name);
+         try c.fns[1].allowDynamicShared(experts.Nvfp4Experts.promptSmem(2, prompt_wn));
+         try c.fns[2].allowDynamicShared(experts.Nvfp4Experts.promptQSmem(2, prompt_wn));
++        try c.fns[3].allowDynamicShared(experts.Nvfp4Experts.promptQSmem(2, prompt_wn));
+         c.resident = @max(1, try c.fns[0].occupancy(128, 0)) * sms;
+         return c;
+     }
+@@ -133,17 +145,40 @@ pub const Softcap = struct {
+         const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = experts.Nvfp4Experts.promptQSmem(2, prompt_wn) };
+         try launch_.launch(c.fns[2], cfg, s, &a);
+     }
++
++    pub fn runTcQQ(c: Softcap, s: Stream, xc: u64, xsc: u64, x_stride: usize, slots: usize, l: Layer, p: Plan, out_codes: u64, out_scales: u64, items: usize, skip: i32) !void {
++        const nb = l.width / 32;
++        const grid = items * ((nb + prompt_wn - 1) / prompt_wn);
++        if (grid < 1) return;
++        const caps = kernelCaps(l);
++        var a: launch_.Args = .{};
++        a.add(xc);
++        a.add(xsc);
++        a.add(@as(i32, @intCast(x_stride)));
++        a.add(@as(i32, @intCast(slots)));
++        a.add(l.up);
++        a.add(l.up_scale);
++        a.add(@as(i32, @intCast(l.dims / 32)));
++        a.add(@as(i32, @intCast(nb)));
++        for ([_]u64{ p.items, p.counts, p.members, out_codes, out_scales }) |v| a.add(v);
++        a.add(@as(i32, @intCast(l.width)));
++        a.add(caps[0]);
++        a.add(caps[1]);
++        a.add(skip);
++        const cfg: launch_.Config = .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 }, .shared = experts.Nvfp4Experts.promptQSmem(2, prompt_wn) };
++        try launch_.launch(c.fns[3], cfg, s, &a);
++    }
+ };
+ 
+ /// MXFP8 experts: e4m3 codes with one E8M0 scale per output row per 32 inputs, blocks of 32 columns by 32 inputs.
+ pub const Mxfp8Experts = struct {
+     mod: Module,
+-    fns: [8]Function, // decode: 0..2; prompt: 3..4; tc_q: 5..6; quant_x: 7
++    fns: [9]Function, // decode: 0..2; prompt: 3..4; tc_q: 5..6; quant_x: 7; tc_qq: 8
+     resident: [3]usize, // the decode entries' blocks a grid may hold
+ 
+     pub const words = 264; // int32 a block: fp8g's 256 code words ([32 lanes][2][4]), then 32 E8M0 bytes
+     pub const prompt_cw = [2]usize{ 2, 4 }; // column warps a prompt CTA: gate-up, down (64 pairs an item)
+-    pub const symbols = [8][:0]const u8{ "tf_mxfp8_softcap", "tf_mxfp8_down_f32", "tf_mxfp8_down_bf16", "tf_mxfp8_prompt_softcap", "tf_mxfp8_prompt_down", "tf_mxfp8_prompt_softcap_tc_q", "tf_mxfp8_prompt_down_tc_q", "tf_mxfp8_quant_x" };
++    pub const symbols = [9][:0]const u8{ "tf_mxfp8_softcap", "tf_mxfp8_down_f32", "tf_mxfp8_down_bf16", "tf_mxfp8_prompt_softcap", "tf_mxfp8_prompt_down", "tf_mxfp8_prompt_softcap_tc_q", "tf_mxfp8_prompt_down_tc_q", "tf_mxfp8_quant_x", "tf_mxfp8_prompt_softcap_tc_qq" };
+ 
+     pub fn load(d: *const driver.Driver, sms: usize) !Mxfp8Experts {
+         if (!kernels.available) return error.BuiltWithoutKernels;
+@@ -201,6 +236,32 @@ pub const Mxfp8Experts = struct {
+         try launch_.launch(e.fns[fi], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
+     }
+ 
++    pub fn runPromptTcQQ(e: *const Mxfp8Experts, s: Stream, xc: u64, xsc: u64, x_stride: usize, slots: usize, l: Layer, p: Plan, out_codes: u64, out_scales: u64, items: usize, skip: i32) !void {
++        const n = l.width;
++        const k = l.dims;
++        if (n % 32 != 0 or k % 32 != 0) return error.UnexpectedShape;
++        const nb = n / 32;
++        const cw = prompt_cw[0];
++        if (nb % cw != 0) return error.UnexpectedShape;
++        const grid = items * (nb / cw);
++        if (grid < 1) return;
++        const caps = kernelCaps(l);
++        var a: launch_.Args = .{};
++        a.add(xc);
++        a.add(xsc);
++        a.add(@as(i32, @intCast(x_stride)));
++        a.add(@as(i32, @intCast(slots)));
++        a.add(l.up);
++        a.add(@as(i32, @intCast(k / 32)));
++        a.add(@as(i32, @intCast(nb)));
++        for ([_]u64{ p.items, p.counts, p.members, out_codes, out_scales }) |v| a.add(v);
++        a.add(@as(i32, @intCast(n)));
++        a.add(caps[0]);
++        a.add(caps[1]);
++        a.add(skip);
++        try launch_.launch(e.fns[8], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128 } }, s, &a);
++    }
++
+     /// The entry a call takes, or the refusal: prompt rows have no fp32 down.
+     pub fn entry(prompt: bool, epi: Epi) !usize {
+         return switch (epi) {
+diff --git a/zig/src/families/inkling2/mini_visit.zig b/zig/src/families/inkling2/mini_visit.zig
+index 2ae7e7eb6..7d203ed10 100644
+--- a/zig/src/families/inkling2/mini_visit.zig
++++ b/zig/src/families/inkling2/mini_visit.zig
+@@ -405,14 +405,28 @@ fn moe(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, L: *const w
+     if (r.prompt) {
+         if (cuda.experts_mx.prefillTcMode() != 0 and L.experts.format == .nvfp4 and h % 64 == 0 and t.expert_inter % 64 == 0) {
+             try k.nv.quantX(s, m.s.xm, h, n, h, m.s.x_tc_codes, m.s.x_tc_scales);
+-            try k.nv.runPromptTc(s, .up, m.s.x_tc_codes, m.s.x_tc_scales, h, t.topk, L.experts, m.s.plan, m.s.act, items, -1);
+-            try k.nv.quantX(s, m.s.act, t.expert_inter, pairs, t.expert_inter, m.s.x_tc_codes, m.s.x_tc_scales);
+-            try k.nv.runPromptTc(s, .down_bf16, m.s.x_tc_codes, m.s.x_tc_scales, t.expert_inter, 0, L.experts, m.s.plan, m.s.y, items, -1);
++            if (cuda.experts_mx.prefillTcFusedQ()) {
++                const act_codes = m.s.act;
++                const act_scales = m.s.act + std.mem.alignForward(usize, pairs * (t.expert_inter / 2), 256);
++                try k.nv.softcap.runTcQQ(s, m.s.x_tc_codes, m.s.x_tc_scales, h, t.topk, L.experts, m.s.plan, act_codes, act_scales, items, -1);
++                try k.nv.runPromptTc(s, .down_bf16, act_codes, act_scales, t.expert_inter, 0, L.experts, m.s.plan, m.s.y, items, -1);
++            } else {
++                try k.nv.runPromptTc(s, .up, m.s.x_tc_codes, m.s.x_tc_scales, h, t.topk, L.experts, m.s.plan, m.s.act, items, -1);
++                try k.nv.quantX(s, m.s.act, t.expert_inter, pairs, t.expert_inter, m.s.x_tc_codes, m.s.x_tc_scales);
++                try k.nv.runPromptTc(s, .down_bf16, m.s.x_tc_codes, m.s.x_tc_scales, t.expert_inter, 0, L.experts, m.s.plan, m.s.y, items, -1);
++            }
+         } else if (cuda.experts_mx.prefillTcMode() != 0 and L.experts.format == .mxfp8 and h % 32 == 0 and t.expert_inter % 32 == 0) {
+             try k.mx.quantX(s, m.s.xm, h, n, h, m.s.x_tc_codes, m.s.x_tc_scales);
+-            try k.mx.runPromptTc(s, .up, m.s.x_tc_codes, m.s.x_tc_scales, h, t.topk, L.experts, m.s.plan, m.s.act, items, -1);
+-            try k.mx.quantX(s, m.s.act, t.expert_inter, pairs, t.expert_inter, m.s.x_tc_codes, m.s.x_tc_scales);
+-            try k.mx.runPromptTc(s, .down_bf16, m.s.x_tc_codes, m.s.x_tc_scales, t.expert_inter, 0, L.experts, m.s.plan, m.s.y, items, -1);
++            if (cuda.experts_mx.prefillTcFusedQ()) {
++                const act_codes = m.s.act;
++                const act_scales = m.s.act + std.mem.alignForward(usize, pairs * t.expert_inter, 256);
++                try k.mx.runPromptTcQQ(s, m.s.x_tc_codes, m.s.x_tc_scales, h, t.topk, L.experts, m.s.plan, act_codes, act_scales, items, -1);
++                try k.mx.runPromptTc(s, .down_bf16, act_codes, act_scales, t.expert_inter, 0, L.experts, m.s.plan, m.s.y, items, -1);
++            } else {
++                try k.mx.runPromptTc(s, .up, m.s.x_tc_codes, m.s.x_tc_scales, h, t.topk, L.experts, m.s.plan, m.s.act, items, -1);
++                try k.mx.quantX(s, m.s.act, t.expert_inter, pairs, t.expert_inter, m.s.x_tc_codes, m.s.x_tc_scales);
++                try k.mx.runPromptTc(s, .down_bf16, m.s.x_tc_codes, m.s.x_tc_scales, t.expert_inter, 0, L.experts, m.s.plan, m.s.y, items, -1);
++            }
+         } else {
+             try gx.prompt(s, .up, up_in, L.experts, m.s.plan, m.s.act, items, pairs, tile, -1);
+             try gx.prompt(s, .down_bf16, down_in, L.experts, m.s.plan, m.s.y, items, pairs, tile, -1);
+-- 
+2.43.0
+

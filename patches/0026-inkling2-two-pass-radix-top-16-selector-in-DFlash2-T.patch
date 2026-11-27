@@ -1,0 +1,206 @@
+From 741c6b343998ee865ece48d7fdb3c4ea6567d101 Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:03:14 +0200
+Subject: [PATCH] inkling2: two-pass radix top-16 selector in DFlash2
+ (TF_INKLING2_DFLASH2_TOP16_RADIX)
+
+Replace the 16-pass SMEM scan in tf_ink2d_top16_part with a single-load
+register-cached two-pass radix cutoff over ordered BF16 keys
+(tf_ink2d_top16_part_radix), preserving exact top-16 values and tie-break
+order (lowest ID). Controlled by TF_INKLING2_DFLASH2_TOP16_RADIX (default on).
+
+Exactness: 48/48 A-B-B-A token SHAs identical, identical acceptance rates.
+dec8 A-B-B-A: bench8 +1.30% (161.4 -> 163.5), live8 +1.08% (146.6 -> 148.1),
+bench4 +0.52%, greedy1 +0.40%, bench1 +0.20%.
+---
+ zig/kernels/cuda/inkling2/dflash.cu       | 126 ++++++++++++++++++++++
+ zig/src/families/inkling2/mini_dflash.zig |  15 ++-
+ 2 files changed, 139 insertions(+), 2 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dflash.cu b/zig/kernels/cuda/inkling2/dflash.cu
+index 32ace5403..7f995176f 100644
+--- a/zig/kernels/cuda/inkling2/dflash.cu
++++ b/zig/kernels/cuda/inkling2/dflash.cu
+@@ -377,6 +377,132 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2d_top16_part(const __nv
+     for (int t = 0; t < TOP; ++t) takeBest(sv, si, n, rv, ri, pv + base + t, pi + base + t);
+ }
+ 
++// Single-load two-pass radix top-16 per 4096-logit chunk: exact same (value, id) order as tf_ink2d_top16_part.
++__device__ __forceinline__ uint16_t bf16Ord(uint16_t b) {
++    if ((b & 0x7FFFu) > 0x7F80u) return 0u;           // NaN below -inf
++    if (b == 0x8000u) return 0x8000u;                 // -0.0 equals +0.0
++    return (b & 0x8000u) ? static_cast<uint16_t>(~b) : static_cast<uint16_t>(b | 0x8000u);
++}
++
++extern "C" __global__ void __launch_bounds__(256) tf_ink2d_top16_part_radix(const __nv_bfloat16* __restrict__ logits,
++                                                                            int cols, float* __restrict__ pv,
++                                                                            int* __restrict__ pi) {
++    __shared__ uint32_t hist[256];
++    __shared__ uint32_t s_hi_cut, s_above_hi, s_cut, s_cnt, s_need_eq;
++    __shared__ int s_min_j[8];
++    __shared__ float cand_v[TOP];
++    __shared__ int cand_i[TOP];
++    const int tid = threadIdx.x, r = blockIdx.x, c0 = blockIdx.y * CHUNK_COLS;
++    const int n = min(CHUNK_COLS, cols - c0);
++    const uint16_t* row = reinterpret_cast<const uint16_t*>(logits) + (long long)r * cols + c0;
++
++    uint16_t raw[16], key[16];
++    hist[tid] = 0u;
++    __syncthreads();
++#pragma unroll
++    for (int u = 0; u < 16; ++u) {
++        const int j = tid + u * 256;
++        if (j < n) {
++            const uint16_t b = row[j];
++            raw[u] = b;
++            const uint16_t k = bf16Ord(b);
++            key[u] = k;
++            atomicAdd(&hist[k >> 8], 1u);
++        } else {
++            raw[u] = 0xFF80u;
++            key[u] = 0u;
++        }
++    }
++    __syncthreads();
++    if (tid == 0) {
++        uint32_t acc = 0u;
++        int hi = 255;
++        for (; hi >= 0; --hi) {
++            const uint32_t c = hist[hi];
++            if (acc + c >= TOP) break;
++            acc += c;
++        }
++        s_hi_cut = static_cast<uint32_t>(hi);
++        s_above_hi = acc;
++    }
++    __syncthreads();
++    const uint32_t hi_cut = s_hi_cut;
++    hist[tid] = 0u;
++    __syncthreads();
++#pragma unroll
++    for (int u = 0; u < 16; ++u) {
++        const int j = tid + u * 256;
++        if (j < n && (key[u] >> 8) == hi_cut) atomicAdd(&hist[key[u] & 0xFFu], 1u);
++    }
++    __syncthreads();
++    if (tid == 0) {
++        uint32_t acc = s_above_hi;
++        int lo = 255;
++        for (; lo >= 0; --lo) {
++            const uint32_t c = hist[lo];
++            if (acc + c >= TOP) break;
++            acc += c;
++        }
++        s_cut = (hi_cut << 8) | static_cast<uint32_t>(lo);
++        s_cnt = 0u;
++        s_need_eq = TOP - acc;
++    }
++    __syncthreads();
++    const uint32_t cut = s_cut;
++    uint32_t eq_mask = 0u;
++#pragma unroll
++    for (int u = 0; u < 16; ++u) {
++        const int j = tid + u * 256;
++        if (j < n) {
++            if (key[u] > cut) {
++                const uint32_t slot = atomicAdd(&s_cnt, 1u);
++                if (slot < TOP) {
++                    cand_v[slot] = __bfloat162float(__ushort_as_bfloat16(raw[u]));
++                    cand_i[slot] = c0 + j;
++                }
++            } else if (key[u] == cut) {
++                eq_mask |= (1u << u);
++            }
++        }
++    }
++    __syncthreads();
++    const uint32_t need_eq = s_need_eq;
++    const int warp = tid >> 5, lane = tid & 31;
++    for (uint32_t t = 0; t < need_eq; ++t) {
++        int my_j = 0x7fffffff;
++        if (eq_mask) {
++            const int u = __ffs(eq_mask) - 1;
++            my_j = tid + u * 256;
++        }
++        for (int o = 16; o > 0; o >>= 1) my_j = min(my_j, __shfl_xor_sync(0xffffffffu, my_j, o));
++        if (lane == 0) s_min_j[warp] = my_j;
++        __syncthreads();
++        int best_j = s_min_j[0];
++        for (int w = 1; w < 8; ++w) best_j = min(best_j, s_min_j[w]);
++        if (best_j < n && (best_j & 255) == tid) {
++            const int u = best_j >> 8;
++            eq_mask &= ~(1u << u);
++            const uint32_t slot = atomicAdd(&s_cnt, 1u);
++            if (slot < TOP) {
++                cand_v[slot] = __bfloat162float(__ushort_as_bfloat16(raw[u]));
++                cand_i[slot] = c0 + best_j;
++            }
++        }
++        __syncthreads();
++    }
++    const long long base = ((long long)r * gridDim.y + blockIdx.y) * TOP;
++    if (tid < TOP) {
++        const float my_v = cand_v[tid];
++        const int my_i = cand_i[tid];
++        int rank = 0;
++#pragma unroll
++        for (int k = 0; k < TOP; ++k)
++            if (better(cand_v[k], cand_i[k], my_v, my_i)) ++rank;
++        pv[base + rank] = my_v;
++        pi[base + rank] = my_i;
++    }
++}
++
+ // out [R][2 * TOP]: 16 ids, then their values' bits, best first. grid (R), 256 threads; chunks <= 64.
+ extern "C" __global__ void __launch_bounds__(256) tf_ink2d_top16_merge(const float* __restrict__ pv, const int* __restrict__ pi, int chunks,
+                                                                        int* __restrict__ out) {
+diff --git a/zig/src/families/inkling2/mini_dflash.zig b/zig/src/families/inkling2/mini_dflash.zig
+index 202371dce..689e3f7d4 100644
+--- a/zig/src/families/inkling2/mini_dflash.zig
++++ b/zig/src/families/inkling2/mini_dflash.zig
+@@ -165,6 +165,7 @@ const Kernels = struct {
+     attn_part_sh: cuda.Function,
+     attn_merge: cuda.Function,
+     top16_part: cuda.Function,
++    top16_part_radix: cuda.Function,
+     top16_merge: cuda.Function,
+     select: cuda.Function,
+     amax: cuda.Function,
+@@ -179,7 +180,7 @@ const Kernels = struct {
+         var k: Kernels = undefined;
+         k.mod = mod;
+         k.mtp = mtp;
+-        inline for (.{ "norm", "conv", "swiglu", "block_qkv", "ctx_kv", "ctx_kv_batch", "attn_part", "attn_part_sh", "attn_merge", "top16_part", "top16_merge", "select" }) |name| {
++        inline for (.{ "norm", "conv", "swiglu", "block_qkv", "ctx_kv", "ctx_kv_batch", "attn_part", "attn_part_sh", "attn_merge", "top16_part", "top16_part_radix", "top16_merge", "select" }) |name| {
+             @field(k, name) = try mod.function("tf_ink2d_" ++ name);
+         }
+         k.amax = try mtp.function("tf_ink2m_amax");
+@@ -947,7 +948,8 @@ pub const Drafter = struct {
+             a.add(@as(i32, @intCast(V)));
+             a.add(x.pv);
+             a.add(x.pi);
+-            try go(x.k.top16_part, x.s, .{ .x = @intCast(M), .y = @intCast(chunks) }, 256, &a);
++            const top16_fn = if (top16RadixOn()) x.k.top16_part_radix else x.k.top16_part;
++            try go(top16_fn, x.s, .{ .x = @intCast(M), .y = @intCast(chunks) }, 256, &a);
+             var b: cuda.Args = .{};
+             b.add(x.pv);
+             b.add(x.pi);
+@@ -1158,6 +1160,15 @@ fn admit(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !void {
+     if (!ok) return error.UnsupportedDFlash2Config;
+ }
+ 
++/// TF_INKLING2_DFLASH2_TOP16_RADIX=0: disable radix top-16 selector in DFlash2.
++fn top16RadixOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_DFLASH2_TOP16_RADIX")) |e| e[0] != '0' else true;
++    return S.v.?;
++}
++
+ test "a ring holds a window of every layer's K and V" {
+     try std.testing.expectEqual(@as(usize, 5 * 2 * 2048 * 1024 * 2), ring_bytes);
+     try std.testing.expectEqual(@as(usize, 576), dyn_width);
+-- 
+2.43.0
+

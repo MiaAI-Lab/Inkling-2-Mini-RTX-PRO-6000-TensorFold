@@ -1,0 +1,242 @@
+From b275a5aedc67a1613fe402898bb3b7db767c9c0d Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 02:49:00 +0200
+Subject: [PATCH] inkling2: P3 opt-in FP8 tensor-core prompt attention
+ projections with per-row scaling (TF_INKLING2_ATTN_FP8_TC=1, default off)
+
+---
+ zig/kernels/cuda/ck_lane.cu              | 67 ++++++++++++++++++++++--
+ zig/src/families/inkling2/mini_model.zig |  9 ++++
+ zig/src/families/inkling2/mini_visit.zig | 60 ++++++++++++++++++---
+ 3 files changed, 125 insertions(+), 11 deletions(-)
+
+diff --git a/zig/kernels/cuda/ck_lane.cu b/zig/kernels/cuda/ck_lane.cu
+index 0d70e6ca5..031032a73 100644
+--- a/zig/kernels/cuda/ck_lane.cu
++++ b/zig/kernels/cuda/ck_lane.cu
+@@ -33,10 +33,10 @@ struct Tile {
+ #include "common/unpack8_value.cuh"
+ 
+ // x e4m3 [M, K] and w e4m3 [npad/64, K/64, 8, 32, 2, 8], both in the fragment order quant8 and the FP8 pack write.
+-template <typename C, bool CLUSTER>
++template <typename C, bool CLUSTER, bool ROW_SCALE = false>
+ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float alpha,
+                                      __nv_bfloat16* __restrict__ out, float* __restrict__ part, int M, int N, int K,
+-                                     int SK, int group) {
++                                     int SK, int group, const float* __restrict__ row_scales = nullptr) {
+     using T = Tile<C, CLUSTER>;
+     constexpr int THREADS = C::THREADS, CH = T::ROW / 16;
+     extern __shared__ __align__(128) unsigned char buf[];
+@@ -155,7 +155,8 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
+                         if (col + 1 < N) dst[1] = acc[i][j][2 * h + 1];
+                         continue;
+                     }
+-                    put(row, col, acc[i][j][2 * h] * alpha, acc[i][j][2 * h + 1] * alpha);
++                    const float a = ROW_SCALE ? alpha * row_scales[row] : alpha;
++                    put(row, col, acc[i][j][2 * h] * a, acc[i][j][2 * h + 1] * a);
+                 }
+             }
+     }
+@@ -181,6 +182,66 @@ TF_CK8(tf_ck8_64sc, 64, 64, 1, true, true)
+ TF_CK8(tf_ck8_128, 128, 64, 2, true, false)
+ TF_CK8(tf_ck8_128c, 128, 128, 2, true, true)
+ 
++// P3: 128x128 unsplit-K FP8 tensor-core GEMM with per-row input scales and per-tensor weight scale.
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ck8_128_row(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float w_scale,
++                   const float* __restrict__ row_scales, __nv_bfloat16* __restrict__ out, int M, int N, int K,
++                   int group) {
++    tf_ck::lane<tf_ck::Cfg<128, 128, 2, 4, true>, false, true>(x, w, w_scale, out, nullptr, M, N, K, 1, group,
++                                                               row_scales);
++}
++
++// P3: Per-row e4m3 quantization into fragment order (1 block of 256 threads per row).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ck_quant8_row(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, uint8_t* __restrict__ out,
++                     float* __restrict__ scales) {
++    __shared__ float sm[8];
++    const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    if (row >= M) return;
++    const __nv_bfloat16* src_row = x + static_cast<size_t>(row) * ldx;
++    float amax = 0.0f;
++    for (int i = tid * 8; i < K; i += 256 * 8) {
++        const uint4 v = *reinterpret_cast<const uint4*>(src_row + i);
++        float f[8];
++        tf_ck::unpack8(v, f);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) amax = fmaxf(amax, fabsf(f[j]));
++    }
++    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++    if (lane == 0) sm[warp] = amax;
++    __syncthreads();
++    if (warp == 0) {
++        amax = lane < 8 ? sm[lane] : 0.0f;
++        for (int o = 4; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
++        if (lane == 0) {
++            const float sc = amax > 0.0f ? amax / 448.0f : 1.0f;
++            sm[0] = sc;
++            scales[row] = sc;
++        }
++    }
++    __syncthreads();
++    const float inv = 1.0f / sm[0];
++    const int groups = K / 16;
++    for (int grp = tid; grp < groups; grp += 256) {
++        const uint4* src = reinterpret_cast<const uint4*>(src_row + grp * 16);
++        float f[16];
++        tf_ck::unpack8(src[0], *reinterpret_cast<float(*)[8]>(f));
++        tf_ck::unpack8(src[1], *reinterpret_cast<float(*)[8]>(f + 8));
++        uint32_t w[4];
++#pragma unroll
++        for (int q = 0; q < 4; ++q) {
++            uint32_t packed = 0;
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const int k = 2 * q + (j % 2) + 8 * (j / 2);
++                packed |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(f[k] * inv, __NV_SATFINITE, __NV_E4M3)) << (8 * j);
++            }
++            w[q] = packed;
++        }
++        *reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K + grp * 16) = make_uint4(w[0], w[1], w[2], w[3]);
++    }
++}
++
+ // The slices summed in slice order, one fp32 add a slice, then the factor and one bf16 rounding.
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_ck8_reduce(const float* __restrict__ part, __nv_bfloat16* __restrict__ out, long long total, int SK, float alpha) {
+diff --git a/zig/src/families/inkling2/mini_model.zig b/zig/src/families/inkling2/mini_model.zig
+index ad5f5b8b1..df7420b23 100644
+--- a/zig/src/families/inkling2/mini_model.zig
++++ b/zig/src/families/inkling2/mini_model.zig
+@@ -55,6 +55,9 @@ pub const Kernels = struct {
+     mtp_mod: cuda.Module, // mtp.cu: the taps a drafter reads and the conv backups a rollback restores from
+     tap_fn: cuda.Function,
+     backup_fn: cuda.Function,
++    ck_mod: cuda.Module, // ck_lane.cu: P3 FP8 tensor-core prompt projections with per-row scaling
++    ck_quant8_row: cuda.Function,
++    ck8_128_row: cuda.Function,
+ 
+     pub fn load(ctx: *const cuda.Context) !Kernels {
+         const d = ctx.d;
+@@ -92,10 +95,16 @@ pub const Kernels = struct {
+         errdefer k.mtp_mod.unload();
+         k.tap_fn = try k.mtp_mod.function("tf_ink2m_tap");
+         k.backup_fn = try k.mtp_mod.function("tf_ink2m_conv_backup");
++        k.ck_mod = try cuda.Module.load(d, cuda.kernels.ck_lane);
++        errdefer k.ck_mod.unload();
++        k.ck_quant8_row = try k.ck_mod.function("tf_ck_quant8_row");
++        k.ck8_128_row = try k.ck_mod.function("tf_ck8_128_row");
++        try k.ck8_128_row.allowDynamicShared(65536);
+         return k;
+     }
+ 
+     pub fn deinit(k: *Kernels) void {
++        k.ck_mod.unload();
+         k.mtp_mod.unload();
+         k.plan_mod.unload();
+         k.glue.unload();
+diff --git a/zig/src/families/inkling2/mini_visit.zig b/zig/src/families/inkling2/mini_visit.zig
+index 7d203ed10..d66ef68ad 100644
+--- a/zig/src/families/inkling2/mini_visit.zig
++++ b/zig/src/families/inkling2/mini_visit.zig
+@@ -130,6 +130,50 @@ fn proj(m: *const Model, k: *const Kernels, s: cuda.Stream, w: cuda.qmmf.Weight,
+     try k.lane.matmulOut(s, x, w.k, n, w, out, .bf16, m.s.lane_part);
+ }
+ 
++/// TF_INKLING2_ATTN_FP8_TC=1 (P3, lossy, default off): FP8 tensor-core attention projections for prompt rows.
++fn attnFp8TcOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_ATTN_FP8_TC")) |e| e[0] == '1' else false;
++    return S.v.?;
++}
++
++fn quant8Row(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, kcols: usize, out: u64, scales: u64) !void {
++    var a: cuda.Args = .{};
++    a.add(x);
++    a.add(@as(i32, @intCast(kcols)));
++    a.add(@as(i32, @intCast(n)));
++    a.add(@as(i32, @intCast(kcols)));
++    a.add(out);
++    a.add(scales);
++    try cuda.launch.launch(k.ck_quant8_row, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, s, &a);
++}
++
++fn projTc(k: *const Kernels, s: cuda.Stream, w: cuda.qmmf.Weight, x8: u64, xsc: u64, out: u64, n: usize) !void {
++    const bm: usize = 128;
++    const bn: usize = 128;
++    const rows_t = (n + bm - 1) / bm;
++    const cols_t = (w.n + bn - 1) / bn;
++    const group = @max(1, @min(rows_t, (12 << 20) / (bm * w.k)));
++    var a: cuda.Args = .{};
++    a.add(x8);
++    a.add(w.codes);
++    a.add(w.scale);
++    a.add(xsc);
++    a.add(out);
++    for ([_]usize{ n, w.n, w.k, group }) |v| a.add(@as(i32, @intCast(v)));
++    try cuda.launch.launch(k.ck8_128_row, .{ .grid = .{ .x = @intCast(rows_t * cols_t) }, .block = .{ .x = 256 }, .shared = 65536 }, s, &a);
++}
++
++fn projPrompt(m: *const Model, k: *const Kernels, s: cuda.Stream, prompt: bool, w: cuda.qmmf.Weight, x: u64, out: u64, n: usize) !void {
++    if (prompt and w.mode == .fp8 and attnFp8TcOn() and n >= 64 and w.k % 64 == 0) {
++        try quant8Row(k, s, x, n, w.k, m.s.x_tc_codes, m.s.x_tc_scales);
++        return projTc(k, s, w, m.s.x_tc_codes, m.s.x_tc_scales, out, n);
++    }
++    return proj(m, k, s, w, x, out, n);
++}
++
+ /// TF_INKLING2_FUSED_ROWS=0: forwards of more than one row run the six input projections one GEMM each, as before.
+ fn fusedRows() bool {
+     const S = struct {
+@@ -259,8 +303,8 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+         const kvw = kvWidth(m);
+         const kvh: usize = t.local.kv;
+         const taps = kvh * config.conv_taps;
+-        try proj(m, k, s, a.wk, xk, o.k, n);
+-        try proj(m, k, s, a.wv, xv, o.v, n);
++        try projPrompt(m, k, s, true, a.wk, xk, o.k, n);
++        try projPrompt(m, k, s, true, a.wv, xv, o.v, n);
+         for ([_]u64{ xk, xv }, [_]u64{ a.k_taps, a.v_taps }, 0..) |x, w, side| {
+             try k.dense.rowsScaled(s, x, h, w, m.w.ones, m.s.dyn[side], taps, n, taps, h);
+         }
+@@ -328,7 +372,7 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+         // then each part copied to the plane its consumers read
+         const f = wts.Fused.of(t);
+         const ld: usize = if (separate) f.qx else f.all;
+-        try proj(m, k, s, if (separate) a.qx else a.all, xq, m.s.fused, n);
++        try projPrompt(m, k, s, r.prompt, if (separate) a.qx else a.all, xq, m.s.fused, n);
+         const qw: usize = @as(usize, t.local.q) * t.local.dim;
+         var sc: ops.SplitCols = .{ .n = if (separate) 4 else 6 };
+         const parts = [6]struct { u64, usize, usize }{ .{ o.q, f.q, qw }, .{ o.gate, f.gate, qw }, .{ o.rel, f.rel, @as(usize, t.local.q) * t.d_rel }, .{ o.sink, f.sink, t.local.q }, .{ o.k, f.k, kvWidth(m) }, .{ o.v, f.v, kvWidth(m) } };
+@@ -339,13 +383,13 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+         }
+         try ops.splitCols(&k.ops, s, m.s.fused, ld, n, sc);
+         if (separate) {
+-            try proj(m, k, s, a.wk, xk, o.k, n);
+-            try proj(m, k, s, a.wv, xv, o.v, n);
++            try projPrompt(m, k, s, r.prompt, a.wk, xk, o.k, n);
++            try projPrompt(m, k, s, r.prompt, a.wv, xv, o.v, n);
+         }
+     } else {
+         try proj(m, k, s, a.wq, xq, o.q, n);
+-        try proj(m, k, s, a.wk, xk, o.k, n);
+-        try proj(m, k, s, a.wv, xv, o.v, n);
++        try projPrompt(m, k, s, true, a.wk, xk, o.k, n);
++        try projPrompt(m, k, s, true, a.wv, xv, o.v, n);
+         try proj(m, k, s, a.wr, xq, o.rel, n);
+         try proj(m, k, s, a.gate, xq, o.gate, n);
+         try proj(m, k, s, a.sink, xq, o.sink, n);
+@@ -369,7 +413,7 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+     try attn.relTable(&k.attn, s, rows, m.s.relp, a.rel_proj, m.s.tab);
+     const stride = attn.slotsFor(l, m.context);
+     try attn.attend(&k.attn, s, rows, l, stride, m.s.entries, m.s.qp, cache, m.s.tab, m.s.part_o, m.s.part_ml, o.sink, o.gate, m.s.att);
+-    try proj(m, k, s, a.wo, m.s.att, m.s.o, n);
++    try projPrompt(m, k, s, r.prompt, a.wo, m.s.att, m.s.o, n);
+     // the attention conv into the fp32 residual: a block boundary keeps only the attention output as the partial
+     try conv(m, k, s, r, v, .attn, .{ .x = m.s.o, .state = 0, .w = L.attn_conv, .base = if (spec.boundary) 0 else hin, .resid = m.s.h32, .x_bf16 = 1, .c = @intCast(h), .rows = 0, .mode = 1 });
+     if (spec.boundary and !p.restarts(v)) try m.copy(s, m.s.blocks + @as(usize, i / t.block) * plane * 2, hin, plane * 2);
+-- 
+2.43.0
+

@@ -1,0 +1,355 @@
+From 6151b55816571b244b4846a40d075f3a5acd75ea Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 05:13:35 +0200
+Subject: [PATCH] inkling2: native e2m1x2/e4m3x2 decode expert unpacking
+ (TF_INKLING2_EXPERT_NATIVE_UNPACK)
+
+Opt nvfp4_experts into -Dnative-fp-decode and add native decode expert
+entries for NVFP4 (e2m1x2 + e4m3x2 scales) and MXFP8 (e4m3x2) behind
+TF_INKLING2_EXPERT_NATIVE_UNPACK (default on).
+
+Exactness: 6/6 ex.sh cells pass (30/30 rows identical to s3_base),
+48/48 A-B-B-A token SHAs identical.
+dec8 A-B-B-A: plain1 +0.23%, greedy1 +0.29%, bench1 +0.54%, bench2 +0.28%,
+bench4 +0.33%, bench8 +0.15%, live8 +0.65%.
+---
+ zig/build/cuda_kernels.zig        |   2 +-
+ zig/kernels/cuda/fp8_experts.cu   |  18 ++++-
+ zig/kernels/cuda/nvfp4_experts.cu | 120 ++++++++++++++++++++++++++++--
+ zig/src/cuda/experts.zig          |   8 +-
+ zig/src/cuda/experts_mx.zig       |  22 +++++-
+ 5 files changed, 154 insertions(+), 16 deletions(-)
+
+diff --git a/zig/build/cuda_kernels.zig b/zig/build/cuda_kernels.zig
+index 9565e8335..c86c84715 100644
+--- a/zig/build/cuda_kernels.zig
++++ b/zig/build/cuda_kernels.zig
+@@ -99,7 +99,7 @@ pub const kernels = [_]Kernel{
+     .{ .name = "exlr8_dense", .flags = &.{ "-O3", "--fmad=false" } }, // ours: EXLR8 dense matrices by row, the Metal order
+     .{ .name = "nvfp4_experts_tile", .flags = &.{"-O3"}, .min_sm = 80 },
+     .{ .name = "experts_bf16", .flags = &.{"-O3"} }, // ours: grouped bf16 experts on the plan, mma fragment blocks
+-    .{ .name = "nvfp4_experts", .flags = &.{"-O3"}, .arch_specific = true }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
++    .{ .name = "nvfp4_experts", .flags = &.{"-O3"}, .arch_specific = true, .native_fp = true }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
+     .{ .name = "nvfp4_experts32", .flags = &.{"-O3"} }, // ours: GLM's routed experts at block 32 with csf0 scales
+     .{ .name = "rank_sum", .flags = &.{"-O3"} }, // ours: the rank-order sum of a reduce-scatter (rank_scatter.zig)
+     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
+diff --git a/zig/kernels/cuda/fp8_experts.cu b/zig/kernels/cuda/fp8_experts.cu
+index 2e2d92cfd..d8f25a601 100644
+--- a/zig/kernels/cuda/fp8_experts.cu
++++ b/zig/kernels/cuda/fp8_experts.cu
+@@ -286,7 +286,15 @@ __device__ __forceinline__ uint32_t e8m0x2(uint32_t e) {
+ }
+ 
+ // Column j * 8 + gq's decoded pair (inputs 4t, 4t + 1) and (4t + 2, 4t + 3) of a lane's word.
++template <bool NATIVE = false>
+ __device__ __forceinline__ void pairs(uint32_t word, uint32_t sv, uint32_t& b0, uint32_t& b1) {
++#if TF_FP_NATIVE
++  if constexpr (NATIVE) {
++    b0 = mul2(tf_common::e4m3x2(word), sv);
++    b1 = mul2(tf_common::e4m3x2(word >> 16), sv);
++    return;
++  }
++#endif
+   b0 = mul2(fp8pair(word), sv);
+   b1 = mul2(fp8pair(word >> 16), sv);
+ }
+@@ -317,7 +325,7 @@ __device__ __forceinline__ void load(Stage<M>& st, const uint4* blk, int g, int
+   }
+ }
+ 
+-template <int M>
++template <int M, bool NATIVE = false>
+ __device__ __forceinline__ void sum(float (&acc)[M][1][NTW][4], const Stage<M>& st) {
+ #pragma unroll
+   for (int m = 0; m < M; ++m)
+@@ -327,14 +335,14 @@ __device__ __forceinline__ void sum(float (&acc)[M][1][NTW][4], const Stage<M>&
+ #pragma unroll
+       for (int h = 0; h < 2; ++h) {
+         uint32_t b0, b1;
+-        pairs(comp(st.w[m][h], j), sv, b0, b1);
++        pairs<NATIVE>(comp(st.w[m][h], j), sv, b0, b1);
+         mma(acc[m][0][j], st.xa[h].x, st.xb[h].x, st.xa[h].y, st.xb[h].y, b0, b1);
+       }
+     }
+ }
+ 
+ // Decode rows: a warp's 32 columns of an item over all K, 16 pairs at a time, two k32 stages in registers.
+-template <int M, int EPI>
++template <int M, int EPI, bool NATIVE = false>
+ __device__ __forceinline__ void decode_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
+                                             const uint4* __restrict__ W, int KG, int NB, const int* __restrict__ items,
+                                             const int* __restrict__ counts, const int* __restrict__ members,
+@@ -365,7 +373,7 @@ __device__ __forceinline__ void decode_body(const __nv_bfloat16* __restrict__ X,
+ #pragma unroll
+         for (int d = 0; d < 2; ++d) {
+           if (g0 + d >= KG) break;
+-          sum<M>(acc, st[d]);
++          sum<M, NATIVE>(acc, st[d]);
+           if (g0 + d + 2 < KG) load<M>(st[d], blk, g0 + d + 2, lane, gq, t, x0, x1, v0, v1);
+         }
+       }
+@@ -699,7 +707,9 @@ extern "C" __global__ void __launch_bounds__(256)
+   }
+ #define TF_MX_ARGS(...) __VA_ARGS__
+ TF_MX_ENTRY(tf_mxfp8_softcap, decode_body<TF_MX_ARGS(2, 4)>)
++TF_MX_ENTRY(tf_mxfp8_softcap_nat, decode_body<TF_MX_ARGS(2, 4, true)>)
+ TF_MX_ENTRY(tf_mxfp8_down_f32, decode_body<TF_MX_ARGS(1, 0)>)
++TF_MX_ENTRY(tf_mxfp8_down_f32_nat, decode_body<TF_MX_ARGS(1, 0, true)>)
+ TF_MX_ENTRY(tf_mxfp8_down_bf16, decode_body<TF_MX_ARGS(1, 3)>)
+ TF_MX_ENTRY(tf_mxfp8_prompt_softcap, prompt_body<TF_MX_ARGS(2, 4, 2, 2)>)
+ TF_MX_ENTRY(tf_mxfp8_prompt_down, prompt_body<TF_MX_ARGS(1, 3, 4, 4)>)
+diff --git a/zig/kernels/cuda/nvfp4_experts.cu b/zig/kernels/cuda/nvfp4_experts.cu
+index 9756b03cc..61add83b3 100644
+--- a/zig/kernels/cuda/nvfp4_experts.cu
++++ b/zig/kernels/cuda/nvfp4_experts.cu
+@@ -25,8 +25,40 @@ struct Stage {
+   uint2 xa[2], xb[2];
+ };
+ 
+-template <int M>
++template <int M, bool NATIVE = false>
+ __device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const Stage<M>& st, bool hi) {
++#if TF_FP_NATIVE
++  if constexpr (NATIVE) {
++#pragma unroll
++    for (int m = 0; m < M; ++m)
++#pragma unroll
++      for (int j = 0; j < NTW; ++j) {
++        const uint32_t word = comp(st.w[m], j);
++        const uint32_t lo = word & 0x0F0F0F0Fu, hi_n = (word >> 4) & 0x0F0F0F0Fu;
++        const uint32_t x = lo | (lo >> 12), y = hi_n | (hi_n >> 12);
++        const int sh = (j & 1) * 16;
++        float(&a)[4] = acc[m][0][j];
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++          const uint32_t b0 = tf_common::e2m1x2(h ? x >> 8 : x);
++          const uint32_t b1 = tf_common::e2m1x2(h ? y >> 8 : y);
++          float p[4] = {0.f, 0.f, 0.f, 0.f};
++          mma(p, st.xa[h].x, st.xb[h].x, st.xa[h].y, st.xb[h].y, b0, b1);
++          const uint32_t sw = comp(st.s[m], 2 * h + (j >> 1));
++          const uint32_t sp = tf_common::e4m3x2(sw >> sh);
++          const float s0 = __uint_as_float((sp & 0xFFFFu) << 16);
++          const float s1 = __uint_as_float(sp & 0xFFFF0000u);
++          a[0] = fmaf(p[0], s0, a[0]);
++          a[1] = fmaf(p[1], s1, a[1]);
++          if (hi) {
++            a[2] = fmaf(p[2], s0, a[2]);
++            a[3] = fmaf(p[3], s1, a[3]);
++          }
++        }
++      }
++    return;
++  }
++#endif
+ #pragma unroll
+   for (int m = 0; m < M; ++m)
+ #pragma unroll
+@@ -165,7 +197,7 @@ struct Ring {
+ #endif
+ 
+ // One unit of the decode form: a warp's 32 columns of item `unit / NB` over all K, then the epilogue.
+-template <int M, int EPI, int WARPS>
++template <int M, int EPI, int WARPS, bool NATIVE = false>
+ __device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int wi,
+                                           const __nv_bfloat16* __restrict__ X, int x_stride, int slots,
+                                           const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
+@@ -189,7 +221,7 @@ __device__ __forceinline__ void unit_full(int unit, int lane, int gq, int t, int
+     for (int m = 0; m < M; ++m)
+ #pragma unroll
+       for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
+-    ring.run(KG, wi, lane, t, 0, blk, x0, x1, v0, v1, [&](const Stage<M>& st) { compute_stage<M>(acc, st, v1); });
++    ring.run(KG, wi, lane, t, 0, blk, x0, x1, v0, v1, [&](const Stage<M>& st) { compute_stage<M, NATIVE>(acc, st, v1); });
+ #pragma unroll
+     for (int m = 0; m < M; ++m) {
+       const float g = __ldg(scale + e * M + m);
+@@ -238,8 +270,40 @@ template <int M>
+ using Half = Stage<M, uint2>;
+ 
+ // compute_stage's sums for tiles j = 2jh + jj: scale word 2h + jh, byte pair jj * 16.
+-template <int M>
++template <int M, bool NATIVE = false>
+ __device__ __forceinline__ void compute_half(float (&acc)[M][2][4], const Half<M>& st, bool hi, int jh) {
++#if TF_FP_NATIVE
++  if constexpr (NATIVE) {
++#pragma unroll
++    for (int m = 0; m < M; ++m)
++#pragma unroll
++      for (int jj = 0; jj < 2; ++jj) {
++        const uint32_t word = jj ? st.w[m].y : st.w[m].x;
++        const uint32_t lo = word & 0x0F0F0F0Fu, hi_n = (word >> 4) & 0x0F0F0F0Fu;
++        const uint32_t x = lo | (lo >> 12), y = hi_n | (hi_n >> 12);
++        const int sh = jj * 16;
++        float(&a)[4] = acc[m][jj];
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++          const uint32_t b0 = tf_common::e2m1x2(h ? x >> 8 : x);
++          const uint32_t b1 = tf_common::e2m1x2(h ? y >> 8 : y);
++          float p[4] = {0.f, 0.f, 0.f, 0.f};
++          mma(p, st.xa[h].x, st.xb[h].x, st.xa[h].y, st.xb[h].y, b0, b1);
++          const uint32_t sw = h == 0 ? (jh ? st.s[m].y : st.s[m].x) : (jh ? st.s[m].w : st.s[m].z);
++          const uint32_t sp = tf_common::e4m3x2(sw >> sh);
++          const float s0 = __uint_as_float((sp & 0xFFFFu) << 16);
++          const float s1 = __uint_as_float(sp & 0xFFFF0000u);
++          a[0] = fmaf(p[0], s0, a[0]);
++          a[1] = fmaf(p[1], s1, a[1]);
++          if (hi) {
++            a[2] = fmaf(p[2], s0, a[2]);
++            a[3] = fmaf(p[3], s1, a[3]);
++          }
++        }
++      }
++    return;
++  }
++#endif
+ #pragma unroll
+   for (int m = 0; m < M; ++m)
+ #pragma unroll
+@@ -306,7 +370,7 @@ __device__ __forceinline__ void epilogue_half(const float (&acc)[M][2][4], void*
+ }
+ 
+ // The decode form with two warps a unit (16 columns each): the same sums, twice the warps for few items.
+-template <int M, int EPI, int WARPS>
++template <int M, int EPI, int WARPS, bool NATIVE = false>
+ __device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                                           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                                           const int* __restrict__ counts, const int* __restrict__ members,
+@@ -321,7 +385,7 @@ __global__ void __launch_bounds__(WARPS * 32)
+   half_body<M, EPI, WARPS>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip, 0.f);
+ }
+ 
+-template <int M, int EPI, int WARPS>
++template <int M, int EPI, int WARPS, bool NATIVE>
+ __device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                                           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                                           const int* __restrict__ counts, const int* __restrict__ members,
+@@ -346,7 +410,7 @@ __device__ __forceinline__ void half_body(const __nv_bfloat16* __restrict__ X, i
+       for (int m = 0; m < M; ++m)
+ #pragma unroll
+         for (int j = 0; j < 2; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.f;
+-      ring.run(KG, wi, lane, t, jh, blk, x0, x1, v0, v1, [&](const Half<M>& st) { compute_half<M>(acc, st, v1, jh); });
++      ring.run(KG, wi, lane, t, jh, blk, x0, x1, v0, v1, [&](const Half<M>& st) { compute_half<M, NATIVE>(acc, st, v1, jh); });
+ #pragma unroll
+       for (int m = 0; m < M; ++m) {
+         const float g = __ldg(scale + e * M + m);
+@@ -928,3 +992,45 @@ extern "C" __global__ void __launch_bounds__(128)
+   tf_nvfp4_experts::half_body<1, 0, 4>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit,
+                                        skip, 0.f);
+ }
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_softcap_nat(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                         const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                         const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
++                         float gate_cap, float up_cap, int skip) {
++  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int units = __ldg(counts) * NB;
++  for (int unit = blockIdx.x * 4 + (threadIdx.x >> 5); unit < units; unit += gridDim.x * 4)
++    tf_nvfp4_experts::unit_full<2, 4, 4, true>(unit, lane, gq, t, threadIdx.x >> 5, X, x_stride, slots, W, scale, KG,
++                                               NB, items, members, out, N, gate_cap, skip, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_down_f32_nat(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                          const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                          const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                          int N, float limit, int skip) {
++  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
++  const int units = __ldg(counts) * NB;
++  for (int unit = blockIdx.x * 4 + (threadIdx.x >> 5); unit < units; unit += gridDim.x * 4)
++    tf_nvfp4_experts::unit_full<1, 0, 4, true>(unit, lane, gq, t, threadIdx.x >> 5, X, x_stride, slots, W, scale, KG,
++                                               NB, items, members, out, N, limit, skip);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_softcap_half_nat(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                              const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                              const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                              int N, float gate_cap, float up_cap, int skip) {
++  tf_nvfp4_experts::half_body<2, 4, 4, true>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N,
++                                             gate_cap, skip, up_cap);
++}
++
++extern "C" __global__ void __launch_bounds__(128)
++    tf_nvfp4_down_half_nat(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
++                           const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
++                           const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
++                           int N, float limit, int skip) {
++  tf_nvfp4_experts::half_body<1, 0, 4, true>(X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N,
++                                             limit, skip, 0.f);
++}
+diff --git a/zig/src/cuda/experts.zig b/zig/src/cuda/experts.zig
+index 9f8bcd975..4ea92b372 100644
+--- a/zig/src/cuda/experts.zig
++++ b/zig/src/cuda/experts.zig
+@@ -369,7 +369,11 @@ pub const Nvfp4Experts = struct {
+ 
+     pub fn loadSplit(e: *Nvfp4Experts, sms: usize) !void {
+         var sp: Split = undefined;
+-        for ([2][:0]const u8{ "tf_nvfp4_softcap_half", "tf_nvfp4_down_half" }, &sp.fns, &sp.resident) |name, *f, *r| {
++        const names: [2][:0]const u8 = if (mx.expertNativeUnpack())
++            .{ "tf_nvfp4_softcap_half_nat", "tf_nvfp4_down_half_nat" }
++        else
++            .{ "tf_nvfp4_softcap_half", "tf_nvfp4_down_half" };
++        for (names, &sp.fns, &sp.resident) |name, *f, *r| {
+             f.* = try e.mod.function(name);
+             r.* = @max(1, try f.occupancy(128, 0)) * sms;
+         }
+@@ -461,7 +465,7 @@ pub const Nvfp4Experts = struct {
+                 narrow[marker + 3] = '1';
+                 narrow[name.len] = 0;
+                 break :blk narrow[0..name.len :0];
+-            } else name;
++            } else if (i == 1 and mx.expertNativeUnpack()) "tf_nvfp4_down_f32_nat" else name;
+             e.fns[i] = try mod.function(selected);
+             e.resident[i] = @max(1, try e.fns[i].occupancy(@intCast(warps * 32), 0)) * sms;
+         }
+diff --git a/zig/src/cuda/experts_mx.zig b/zig/src/cuda/experts_mx.zig
+index e21009bbd..4adca0b1d 100644
+--- a/zig/src/cuda/experts_mx.zig
++++ b/zig/src/cuda/experts_mx.zig
+@@ -94,6 +94,17 @@ pub fn prefillTcFusedQ() bool {
+     return S.v.?;
+ }
+ 
++/// TF_INKLING2_EXPERT_NATIVE_UNPACK=0: disable native e2m1x2/e4m3x2 pair unpacking in decode experts.
++pub fn expertNativeUnpack() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) {
++        S.v = if (std.c.getenv("TF_INKLING2_EXPERT_NATIVE_UNPACK")) |e| e[0] != '0' else true;
++    }
++    return S.v.?;
++}
++
+ /// nvfp4_experts.cu's soft-capped SwiGLU gate-up: decode units of 4 warps, and the prompt tiles of 4 warps.
+ pub const Softcap = struct {
+     fns: [4]Function = undefined, // decode, prompt, prompt_tc_q, prompt_tc_qq
+@@ -104,7 +115,10 @@ pub const Softcap = struct {
+ 
+     pub fn resolve(mod: Module, sms: usize) !Softcap {
+         var c: Softcap = .{};
+-        for (symbols, &c.fns) |name, *f| f.* = try mod.function(name);
++        for (symbols, &c.fns, 0..) |name, *f, i| {
++            const sym = if (i == 0 and expertNativeUnpack()) "tf_nvfp4_softcap_nat" else name;
++            f.* = try mod.function(sym);
++        }
+         try c.fns[1].allowDynamicShared(experts.Nvfp4Experts.promptSmem(2, prompt_wn));
+         try c.fns[2].allowDynamicShared(experts.Nvfp4Experts.promptQSmem(2, prompt_wn));
+         try c.fns[3].allowDynamicShared(experts.Nvfp4Experts.promptQSmem(2, prompt_wn));
+@@ -185,7 +199,11 @@ pub const Mxfp8Experts = struct {
+         var mod = try Module.load(d, kernels.fp8_experts);
+         errdefer mod.unload();
+         var e: Mxfp8Experts = .{ .mod = mod, .fns = undefined, .resident = undefined };
+-        for (symbols, &e.fns) |name, *f| f.* = try mod.function(name);
++        const nat = expertNativeUnpack();
++        for (symbols, &e.fns, 0..) |name, *f, i| {
++            const sym = if (nat and i == 0) "tf_mxfp8_softcap_nat" else if (nat and i == 1) "tf_mxfp8_down_f32_nat" else name;
++            f.* = try mod.function(sym);
++        }
+         for (&e.resident, 0..) |*r, i| r.* = @max(1, try e.fns[i].occupancy(128, 0)) * sms;
+         return e;
+     }
+-- 
+2.43.0
+

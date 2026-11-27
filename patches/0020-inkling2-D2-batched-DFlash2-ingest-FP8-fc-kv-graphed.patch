@@ -1,0 +1,398 @@
+From 490749c968e2cb56e4adc3347c7a8adc2798673b Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 01:27:29 +0200
+Subject: [PATCH] inkling2: D2 batched DFlash2 ingest, FP8 fc/kv, graphed
+ holds, and shared ring attention
+
+---
+ zig/kernels/cuda/inkling2/dflash.cu       | 101 ++++++++++++++
+ zig/src/families/inkling2/mini_dflash.zig | 152 +++++++++++++++++++++-
+ 2 files changed, 248 insertions(+), 5 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/dflash.cu b/zig/kernels/cuda/inkling2/dflash.cu
+index 6bb8d5c67..32ace5403 100644
+--- a/zig/kernels/cuda/inkling2/dflash.cu
++++ b/zig/kernels/cuda/inkling2/dflash.cu
+@@ -134,6 +134,23 @@ extern "C" __global__ void __launch_bounds__(64) tf_ink2d_ctx_kv(const __nv_bflo
+     vo[threadIdx.x + 64] = row[KVW + kh * HD + threadIdx.x + 64];
+ }
+ 
++// Batched context K/V scatter (D2.1): row r -> ring_of[r] at slot (pos_of[r] % WIN) of `layer`.
++// grid (N, KVH), 64 threads.
++extern "C" __global__ void __launch_bounds__(64) tf_ink2d_ctx_kv_batch(const __nv_bfloat16* __restrict__ kv, const __nv_bfloat16* __restrict__ kn,
++                                                                       const long long* __restrict__ pos_of, const uint64_t* __restrict__ ring_of,
++                                                                       int layer, float eps, float theta) {
++    __shared__ float red[2];
++    const int r = blockIdx.x, kh = blockIdx.y;
++    const long long p = pos_of[r];
++    const uint64_t ring = ring_of[r];
++    const int slot = (int)(p % WIN);
++    const __nv_bfloat16* row = kv + (long long)r * 2 * KVW;
++    normRope(row + kh * HD, kn, eps, p, theta, ringK(ring, layer) + (long long)slot * KVW + kh * HD, red);
++    __nv_bfloat16* vo = ringV(ring, layer) + (long long)slot * KVW + kh * HD;
++    vo[threadIdx.x] = row[KVW + kh * HD + threadIdx.x];
++    vo[threadIdx.x + 64] = row[KVW + kh * HD + threadIdx.x + 64];
++}
++
+ // Each block's 8 rows attend (non-causally) to their ring's window (max(from, p - 2047) .. start - 1) and all 8 block
+ // keys, split over CH key chunks (running max, sum, fp32 output), merged by tf_ink2d_attn_merge.
+ // grid (S, KVH, CH), 256 threads: a warp a block row, its 4 query heads of this key head.
+@@ -198,6 +215,90 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2d_attn_part(const __nv_
+     }
+ }
+ 
++// D2.4: Shared-tile ring attention: all 8 warps cooperatively stage 16 K/V rows in shared memory (1x global load
++// instead of 8x), covering the widest window (row 0's lo) and masking positions before each row's own lo_j.
++extern "C" __global__ void __launch_bounds__(256) tf_ink2d_attn_part_sh(const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ kb,
++        const __nv_bfloat16* __restrict__ vb, const uint64_t* __restrict__ rings, const long long* __restrict__ starts,
++        const long long* __restrict__ froms, int layer, float scale, float* __restrict__ pm, float* __restrict__ pl,
++        float* __restrict__ pacc) {
++    constexpr int TK = 16;
++    __shared__ __nv_bfloat16 sm_k[TK][HD];
++    __shared__ __nv_bfloat16 sm_v[TK][HD];
++    const int s = blockIdx.x, kh = blockIdx.y, c = blockIdx.z;
++    const int tid = threadIdx.x, j = tid >> 5, lane = tid & 31;
++    const int r = s * BLOCK + j;
++    const long long start = starts[s], from = froms[s];
++    long long lo0 = start - (WIN - 1);
++    if (lo0 < from) lo0 = from;
++    if (lo0 < 0) lo0 = 0;
++    long long lo_j = (start + j) - (WIN - 1);
++    if (lo_j < from) lo_j = from;
++    if (lo_j < 0) lo_j = 0;
++    const long long n_ctx = start > lo0 ? start - lo0 : 0;
++    const long long T = n_ctx + BLOCK, L = (T + CH - 1) / CH;
++    const long long n0 = (long long)c * L, n1 = n0 + L < T ? n0 + L : T;
++    float qv[4][4], m[4], l[4], acc[4][4];
++    for (int h = 0; h < 4; ++h) {
++        const __nv_bfloat16* qh = q + (long long)r * QH * HD + (kh * 4 + h) * HD + lane * 4;
++        for (int i = 0; i < 4; ++i) qv[h][i] = bf(qh[i]) * scale;
++        m[h] = -INFINITY;
++        l[h] = 0.f;
++        for (int i = 0; i < 4; ++i) acc[h][i] = 0.f;
++    }
++    const __nv_bfloat16* K = ringK(rings[s], layer);
++    const __nv_bfloat16* V = ringV(rings[s], layer);
++    // 256 threads load 16 rows x 128 bf16 = 2048 bf16 = 256 x 8 bf16 (one uint4 per thread per K/V)
++    const int load_row = tid >> 4;        // 0..15
++    const int load_col = (tid & 15) * 8;  // 0, 8, ..., 120
++    for (long long base = n0; base < n1; base += TK) {
++        const long long n = base + load_row;
++        if (n < n1) {
++            const __nv_bfloat16 *kr, *vr;
++            if (n < n_ctx) {
++                const int slot = (int)((lo0 + n) % WIN);
++                kr = K + (long long)slot * KVW + kh * HD + load_col;
++                vr = V + (long long)slot * KVW + kh * HD + load_col;
++            } else {
++                const long long rb = (long long)s * BLOCK + (n - n_ctx);
++                kr = kb + rb * KVW + kh * HD + load_col;
++                vr = vb + rb * KVW + kh * HD + load_col;
++            }
++            *reinterpret_cast<uint4*>(&sm_k[load_row][load_col]) = *reinterpret_cast<const uint4*>(kr);
++            *reinterpret_cast<uint4*>(&sm_v[load_row][load_col]) = *reinterpret_cast<const uint4*>(vr);
++        }
++        __syncthreads();
++        const int lim = (int)(n1 - base < TK ? n1 - base : TK);
++        for (int tk = 0; tk < lim; ++tk) {
++            const long long nn = base + tk;
++            if (nn < n_ctx && (lo0 + nn) < lo_j) continue;
++            float kf[4], vf[4];
++            for (int i = 0; i < 4; ++i) {
++                kf[i] = bf(sm_k[tk][lane * 4 + i]);
++                vf[i] = bf(sm_v[tk][lane * 4 + i]);
++            }
++            for (int h = 0; h < 4; ++h) {
++                float d = qv[h][0] * kf[0] + qv[h][1] * kf[1] + qv[h][2] * kf[2] + qv[h][3] * kf[3];
++                for (int off = 16; off > 0; off >>= 1) d += __shfl_xor_sync(0xffffffffu, d, off);
++                const float mn = fmaxf(m[h], d);
++                const float corr = __expf(m[h] - mn), pe = __expf(d - mn);
++                l[h] = l[h] * corr + pe;
++                for (int i = 0; i < 4; ++i) acc[h][i] = acc[h][i] * corr + pe * vf[i];
++                m[h] = mn;
++            }
++        }
++        __syncthreads();
++    }
++    for (int h = 0; h < 4; ++h) {
++        const long long at = ((long long)r * QH + kh * 4 + h) * CH + c;
++        float* pa = pacc + at * HD + lane * 4;
++        for (int i = 0; i < 4; ++i) pa[i] = acc[h][i];
++        if (lane == 0) {
++            pm[at] = m[h];
++            pl[at] = l[h];
++        }
++    }
++}
++
+ // The chunks' partials of row r, head h into o[r][h] (bf16). grid (R, QH), 128 threads (a thread a dim).
+ extern "C" __global__ void __launch_bounds__(128) tf_ink2d_attn_merge(const float* __restrict__ pm, const float* __restrict__ pl,
+                                                                       const float* __restrict__ pacc, __nv_bfloat16* __restrict__ o) {
+diff --git a/zig/src/families/inkling2/mini_dflash.zig b/zig/src/families/inkling2/mini_dflash.zig
+index 069bd199e..202371dce 100644
+--- a/zig/src/families/inkling2/mini_dflash.zig
++++ b/zig/src/families/inkling2/mini_dflash.zig
+@@ -85,6 +85,18 @@ const DraftKey = extern struct { seed: u64, inv_t: f32, pos: u32 };
+ fn layers8On() bool {
+     return envOn("TF_INKLING2_DRAFT_LAYERS8");
+ }
++fn batchIngestOn() bool {
++    return envOn("TF_INKLING2_DRAFT_BATCH_INGEST");
++}
++fn ingest8On() bool {
++    return envOn("TF_INKLING2_DRAFT_INGEST8");
++}
++fn draftGraphsOn() bool {
++    return envOn("TF_INKLING2_DRAFT_GRAPHS");
++}
++fn sharedAttnOn() bool {
++    return envOn("TF_INKLING2_DRAFT_SHARED_ATTN");
++}
+ 
+ const HoldCost = lanes.hold_price.HoldCost;
+ /// A hold pass's ms on one GB10 (TF_INKLING2_DRAFT_TRACE=1): by streams held together; one block a stream at any depth.
+@@ -148,7 +160,9 @@ const Kernels = struct {
+     swiglu: cuda.Function,
+     block_qkv: cuda.Function,
+     ctx_kv: cuda.Function,
++    ctx_kv_batch: cuda.Function,
+     attn_part: cuda.Function,
++    attn_part_sh: cuda.Function,
+     attn_merge: cuda.Function,
+     top16_part: cuda.Function,
+     top16_merge: cuda.Function,
+@@ -165,7 +179,7 @@ const Kernels = struct {
+         var k: Kernels = undefined;
+         k.mod = mod;
+         k.mtp = mtp;
+-        inline for (.{ "norm", "conv", "swiglu", "block_qkv", "ctx_kv", "attn_part", "attn_merge", "top16_part", "top16_merge", "select" }) |name| {
++        inline for (.{ "norm", "conv", "swiglu", "block_qkv", "ctx_kv", "ctx_kv_batch", "attn_part", "attn_part_sh", "attn_merge", "top16_part", "top16_merge", "select" }) |name| {
+             @field(k, name) = try mod.function("tf_ink2d_" ++ name);
+         }
+         k.amax = try mtp.function("tf_ink2m_amax");
+@@ -251,7 +265,12 @@ pub const Drafter = struct {
+     c1: u64 = 0, // bf16 [window][H]
+     ctx: u64 = 0, // bf16 [window][H]
+     ckv: u64 = 0, // bf16 [window][2 * kv]
++    cat: u64 = 0, // bf16 [max_rows][4][H]: batched decode ingest gather buffer
++    cat_pos: u64 = 0, // i64 [max_rows]
++    cat_ring: u64 = 0, // u64 [max_rows]
+     part: u64 = 0,
++    hold_graphs: [max_batch + 1][2]?cuda.graph.Exec = @splat(@splat(null)),
++    synced: bool = false,
+     buffers: std.ArrayList(DeviceBuffer) = .empty,
+     weight_bytes: usize = 0,
+     slots: std.ArrayList(Slot) = .empty,
+@@ -317,6 +336,10 @@ pub const Drafter = struct {
+         if (layers8On()) for (&x.layers) |*l| {
+             inline for (.{ "qkv", "o", "gu", "down", "a_proj", "m_proj" }) |f| @field(l, f) = try x.fp8Of(@field(l, f));
+         };
++        if (ingest8On()) {
++            x.fc = try x.fp8Of(x.fc);
++            for (&x.layers) |*l| l.kv = try x.fp8Of(l.kv);
++        }
+         if (head4On()) x.head = try x.fp4Of(x.target.unembed) else if (fp8HeadOn()) x.head = try x.fp8Of(x.target.unembed);
+         x.chances = chancesOn();
+         x.chances_shared = chancesSharedOn();
+@@ -536,6 +559,9 @@ pub const Drafter = struct {
+         x.c1 = try x.alloc(R * H * 2);
+         x.ctx = try x.alloc(R * H * 2);
+         x.ckv = try x.alloc(R * 2 * kv_width * 2);
++        x.cat = try x.alloc(M * row_bytes);
++        x.cat_pos = try x.alloc(M * 8);
++        x.cat_ring = try x.alloc(M * 8);
+         var part: usize = 0;
+         for (x.layers) |l| {
+             for ([_]Lane{ l.qkv, l.o, l.gu, l.down, l.a_proj, l.m_proj }) |w| for (1..max_batch + 1) |nb| {
+@@ -557,6 +583,10 @@ pub const Drafter = struct {
+     }
+ 
+     pub fn deinit(x: *Drafter) void {
++        for (&x.hold_graphs) |*row| for (row) |*g| if (g.*) |*e| {
++            e.deinit();
++            g.* = null;
++        };
+         x.lanes.deinit(x.gpa);
+         for (x.slot_bufs.items) |*b| b.free();
+         x.slot_bufs.deinit(x.gpa);
+@@ -628,10 +658,13 @@ pub const Drafter = struct {
+         if (x.lanes.fetchRemove(s)) |e| x.slots.items[e.value.slot].used = false;
+     }
+ 
+-    /// The stream's last walk on the host (one sync, then a small read).
++    /// The stream's last walk on the host (one sync per round, then a small read).
+     fn fetch(x: *Drafter, l: *LaneState) !void {
+         if (l.fetched) return;
+-        try x.s.synchronize();
++        if (!x.synced) {
++            try x.s.synchronize();
++            x.synced = true;
++        }
+         try cuda.memory.download(x.d, x.slots.items[l.slot].walk, std.mem.sliceAsBytes(&l.walk));
+         for (0..l.held) |i| if (l.draft(i) >= x.vocab) return error.DraftNonfinite;
+         l.fetched = true;
+@@ -712,8 +745,72 @@ pub const Drafter = struct {
+         return envOn("TF_INKLING2_PROMPT_TRIM");
+     }
+ 
++    fn ingestBatch(x: *Drafter, n: usize) !void {
++        try x.mm_(x.cat, taps.len * H, n, x.fc, x.c1);
++        try x.normRows(x.c1, x.hnorm, x.ctx, n);
++        for (x.layers, 0..) |l, li| {
++            try x.mm_(x.ctx, H, n, l.kv, x.ckv);
++            var b: cuda.Args = .{};
++            b.add(x.ckv);
++            b.add(l.k_norm);
++            b.add(x.cat_pos);
++            b.add(x.cat_ring);
++            b.add(@as(i32, @intCast(li)));
++            b.add(eps);
++            b.add(theta);
++            try go(x.k.ctx_kv_batch, x.s, .{ .x = @intCast(n), .y = kv_heads }, 64, &b);
++        }
++    }
++
+     fn absorbFn(ptr: *anyopaque, items: []const dr.Absorb) anyerror!void {
+         const x = self(ptr);
++        const trace = std.c.getenv("TF_INKLING2_DRAFT_TRACE") != null;
++        var t0: std.c.timespec = undefined;
++        var traced_rows: usize = 0;
++        var any_prompt = false;
++        if (trace) {
++            try x.s.synchronize();
++            _ = std.c.clock_gettime(.MONOTONIC, &t0);
++        }
++        // D2.1: batch multi-stream decode absorbs into one fc + 5 kv pass + scatter.
++        if (batchIngestOn() and items.len > 1) blk: {
++            var tot: usize = 0;
++            for (items) |item| {
++                if (item.prompt or item.rows != null) break :blk;
++                if (item.features.space != .device or item.features.dtype != .bf16 or item.features.row_bytes != row_bytes) return error.DraftFeaturesUnsupported;
++                tot += item.features.rows;
++            }
++            if (tot == 0 or tot > max_rows) break :blk;
++            var pos_h: [max_rows]i64 = undefined;
++            var ring_h: [max_rows]u64 = undefined;
++            var off: usize = 0;
++            for (items) |item| {
++                const l = x.lanes.getPtr(item.stream) orelse return error.DraftStreamUnknown;
++                const f = item.features;
++                if (f.rows == 0) continue;
++                if (x.chances) x.observe(l, item);
++                if (item.start > l.end or l.end == 0) l.from = item.start;
++                const sl = &x.slots.items[l.slot];
++                const n: usize = f.rows;
++                try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(x.cat + off * row_bytes, f.buffer + f.offset, n * row_bytes, x.s.handle), "cuMemcpyDtoDAsync");
++                for (0..n) |r| {
++                    pos_h[off + r] = @intCast(item.start + r);
++                    ring_h[off + r] = sl.ring;
++                }
++                off += n;
++                l.end = item.start + f.rows;
++                l.held = 0;
++                l.fetched = false;
++            }
++            if (off > 0) {
++                try cuda.copy_source.enqueue(x.d, x.cat_pos, std.mem.sliceAsBytes(pos_h[0..off]), x.s);
++                try cuda.copy_source.enqueue(x.d, x.cat_ring, std.mem.sliceAsBytes(ring_h[0..off]), x.s);
++                try x.ingestBatch(off);
++                traced_rows = off;
++            }
++            if (trace and traced_rows > 0) try traceAbsorb(x, items.len, traced_rows, false, t0);
++            return;
++        }
+         for (items) |item| {
+             const l = x.lanes.getPtr(item.stream) orelse return error.DraftStreamUnknown;
+             const f = item.features;
+@@ -722,6 +819,7 @@ pub const Drafter = struct {
+             if (f.rows == 0) continue;
+             if (x.chances) x.observe(l, item);
+             if (item.prompt and promptTrimOn()) {
++                any_prompt = true;
+                 const plen = item.stream.prompt().len;
+                 const live_from: u64 = plen -| window;
+                 const item_end = item.start + f.rows;
+@@ -738,6 +836,7 @@ pub const Drafter = struct {
+                 if (item.start > l.end or l.end == 0) l.from = want_start else l.from = @max(l.from, live_from);
+                 const sl = &x.slots.items[l.slot];
+                 try x.ingest(sl.ring, f.buffer + f.offset + skip * row_bytes, want_start, n);
++                traced_rows += n;
+                 l.end = item_end;
+                 l.held = 0;
+                 l.fetched = false;
+@@ -748,11 +847,33 @@ pub const Drafter = struct {
+             // only the last window of rows can be attended to: earlier ones would be overwritten in the ring
+             const skip: usize = @as(usize, f.rows) -| window;
+             const n: usize = f.rows - skip;
++            any_prompt = any_prompt or item.prompt;
+             try x.ingest(sl.ring, f.buffer + f.offset + skip * row_bytes, item.start + skip, n);
++            traced_rows += n;
+             l.end = item.start + f.rows; // rows past a rewound end are rewritten in place
+             l.held = 0;
+             l.fetched = false;
+         }
++        if (trace and traced_rows > 0) try traceAbsorb(x, items.len, traced_rows, any_prompt, t0);
++    }
++
++    fn traceAbsorb(x: *Drafter, n_items: usize, rows: usize, is_prompt: bool, t0: std.c.timespec) !void {
++        try x.s.synchronize();
++        var t1: std.c.timespec = undefined;
++        _ = std.c.clock_gettime(.MONOTONIC, &t1);
++        const dt = @as(f64, @floatFromInt(t1.sec - t0.sec)) * 1e3 + @as(f64, @floatFromInt(t1.nsec - t0.nsec)) / 1e6;
++        if (is_prompt) return;
++        const T = struct {
++            var ms: [max_batch + 1]f64 = @splat(0);
++            var n: [max_batch + 1]u64 = @splat(0);
++            var calls: u64 = 0;
++        };
++        const b = @min(n_items, max_batch);
++        T.ms[b] += dt;
++        T.n[b] += 1;
++        T.calls += 1;
++        _ = rows;
++        if (T.calls % 50 == 0) for (1..max_batch + 1) |i| if (T.n[i] > 0) std.debug.print("[dflash2 absorbs] size {d}: {d:.2} ms avg over {d}\n", .{ i, T.ms[i] / @as(f64, @floatFromInt(T.n[i])), T.n[i] });
+     }
+ 
+     fn conv(x: *Drafter, z: u64, which: i32, base: u64, out: u64, add: bool, M: usize) !void {
+@@ -791,7 +912,8 @@ pub const Drafter = struct {
+                 a.add(@as(i32, @intCast(li)));
+                 a.add(@as(f32, 1.0 / @sqrt(@as(f32, head_dim))));
+                 for ([_]u64{ x.pm, x.pl, x.pacc }) |v| a.add(v);
+-                try go(x.k.attn_part, x.s, .{ .x = @intCast(S), .y = kv_heads, .z = attn_chunks }, 256, &a);
++                const attn_fn = if (sharedAttnOn()) x.k.attn_part_sh else x.k.attn_part;
++                try go(attn_fn, x.s, .{ .x = @intCast(S), .y = kv_heads, .z = attn_chunks }, 256, &a);
+                 var b: cuda.Args = .{};
+                 for ([_]u64{ x.pm, x.pl, x.pacc, x.att }) |v| b.add(v);
+                 try go(x.k.attn_merge, x.s, .{ .x = @intCast(M), .y = q_heads }, head_dim, &b);
+@@ -919,7 +1041,27 @@ pub const Drafter = struct {
+         try cuda.copy_source.enqueue(x.d, x.froms, std.mem.sliceAsBytes(froms[0..S]), x.s);
+         try cuda.copy_source.enqueue(x.d, x.walks, std.mem.sliceAsBytes(walks[0..S]), x.s);
+         if (keyed) try cuda.copy_source.enqueue(x.d, x.keys, std.mem.sliceAsBytes(keys[0..S]), x.s);
+-        try x.pass(S, keyed);
++        x.synced = false;
++        if (draftGraphsOn() and S <= max_batch) {
++            const g = &x.hold_graphs[S][@intFromBool(keyed)];
++            if (g.* == null) {
++                try x.s.synchronize();
++                try cuda.graph.beginCapture(x.s, .thread_local);
++                x.pass(S, keyed) catch |e| {
++                    if (cuda.graph.endCapture(x.s)) |cg| {
++                        var gg = cg;
++                        gg.deinit();
++                    } else |_| {}
++                    return e;
++                };
++                var cg = try cuda.graph.endCapture(x.s);
++                defer cg.deinit();
++                g.* = try cg.instantiate();
++            }
++            try g.*.?.launchOn(x.s);
++        } else {
++            try x.pass(S, keyed);
++        }
+         for (states[0..S], depths[0..S]) |l, n| l.held = n;
+         x.passes += 1;
+         if (std.c.getenv("TF_INKLING2_DFLASH2_LOG") != null) {
+-- 
+2.43.0
+

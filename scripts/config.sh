@@ -148,6 +148,9 @@ export TF_INKLING2_GLOBAL_ZCAP="${TF_INKLING2_GLOBAL_ZCAP:-0}"
 # Blackwell native FP4/MXFP8 block-scaled tensor cores for prefill experts (patch 0014):
 # 1 = 2-term residual FP4 + MXFP8 (~8-bit activations, near-lossless); 2 = 1-term W4A4 + MXFP8; 0 = exact BF16 MMA.
 export TF_INKLING2_PREFILL_TC="${TF_INKLING2_PREFILL_TC:-1}"
+# FP8 tensor-core prompt attention projections (patch 0022; lossy, engine default off): prompt activations
+# quantized per-row to e4m3 for native FP8 MMA (decode stays BF16). TF_INKLING2_ATTN_FP8_TC=0 for exact BF16.
+export TF_INKLING2_ATTN_FP8_TC="${TF_INKLING2_ATTN_FP8_TC:-1}"
 # The kit's vLLM serves reasoning in a `reasoning` field (its inkling reasoning parser); TensorFold names it
 # reasoning_content. For Derisked both are sent (TF_REASONING_FIELD: reasoning_content, reasoning or both).
 if [[ "$RERISKED" == 1 ]]; then export TF_REASONING_FIELD="${TF_REASONING_FIELD:-both}"; fi

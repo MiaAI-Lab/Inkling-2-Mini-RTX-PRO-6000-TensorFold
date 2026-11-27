@@ -1,0 +1,311 @@
+From c52c72e209d96dab89a761fa00f432c966740655 Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 06:37:15 +0200
+Subject: [PATCH] inkling2: fuse decode K/V conv into prep
+ (TF_INKLING2_DECODE_KV_CONV_PREP)
+
+Fuse K and V 4-tap convolutions (static and dynamic) with clip/RMS and
+KV cache writes into tf_ink2_prep_conv{,8}, running alongside Q/rel prep
+in one launch per decode visit. Eliminates 96 conv launches and scratch
+round-trips per decode round while preserving rollback history and exact
+non-FMA conv rounding. Controlled by TF_INKLING2_DECODE_KV_CONV_PREP
+(default on).
+
+Exactness: 6/6 ex.sh cells pass (30/30 rows identical to s3_base),
+48/48 A-B-B-A token SHAs identical.
+dec8 A-B-B-A: plain1 +0.95% (42.2 -> 42.6), greedy1 +0.68% (59.6 -> 60.0),
+bench1 +0.46% (60.6 -> 60.9), bench2 +0.57% (82.7 -> 83.2),
+bench4 +0.45% (115.9 -> 116.5), bench8 +0.00%, live8 +0.34% (148.2 -> 148.7).
+---
+ zig/kernels/cuda/inkling2/attention.cu   | 142 +++++++++++++++++++++++
+ zig/src/families/inkling2/kernels.zig    |  37 ++++++
+ zig/src/families/inkling2/mini_visit.zig |  32 ++++-
+ 3 files changed, 207 insertions(+), 4 deletions(-)
+
+diff --git a/zig/kernels/cuda/inkling2/attention.cu b/zig/kernels/cuda/inkling2/attention.cu
+index 086020f02..e15b3ce9a 100644
+--- a/zig/kernels/cuda/inkling2/attention.cu
++++ b/zig/kernels/cuda/inkling2/attention.cu
+@@ -135,6 +135,134 @@ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, cons
+     }
+ }
+ 
++// Fused decode K/V 4-tap conv + Q/rel/K/V prep in a single launch (TF_INKLING2_DECODE_KV_CONV_PREP).
++// Q/rel warps (y < heads) run per row; K/V warps (y >= heads) walk each stream's segment in order.
++template <bool KV8>
++__device__ __forceinline__ void prepConvRow(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
++                                            const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
++                                            const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,
++                                            const int* __restrict__ rpos, const int* __restrict__ rseg,
++                                            const Seg* __restrict__ segs, uint16_t* __restrict__ q_out,
++                                            uint16_t* __restrict__ rel_out, uint16_t* __restrict__ kc,
++                                            uint16_t* __restrict__ vc, int heads, int kv_heads, int ring, int global,
++                                            float qk_clip, float rel_clip, float floor_pos, float alpha, float eps,
++                                            float* __restrict__ ksc, float* __restrict__ vsc,
++                                            const int4* __restrict__ conv_segs, int n_streams,
++                                            float* __restrict__ k_state, float* __restrict__ v_state,
++                                            const uint16_t* __restrict__ k_w, const uint16_t* __restrict__ v_w,
++                                            const float* __restrict__ k_dyn, const float* __restrict__ v_dyn,
++                                            float* __restrict__ k_hist, float* __restrict__ v_hist) {
++    const int y = blockIdx.y, lane = threadIdx.x;
++    if (y < heads) {
++        const int row = blockIdx.x;
++        const int pos = rpos[row];
++        const float tau = global ? 1.0f + alpha * logf(fmaxf(static_cast<float>(pos + 1) / floor_pos, 1.0f)) : 1.0f;
++        float x[4];
++        const uint16_t* src = q_raw + (static_cast<size_t>(row) * heads + y) * kDim;
++        for (int i = 0; i < 4; ++i) x[i] = bf(src[lane * 4 + i]) * bf(q_scale[y * kDim + lane * 4 + i]);
++        clip(x, qk_clip);
++        uint16_t* dst = q_out + (static_cast<size_t>(row) * heads + y) * kDim;
++        for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = global ? tobf(bf(tobf(x[i])) * tau) : tobf(x[i]);
++        float r = lane < kRel ? bf(rel_raw[(static_cast<size_t>(row) * heads + y) * kRel + lane]) *
++                                    bf(rel_scale[y * kRel + lane])
++                              : 0.0f;
++        const float norm = sqrtf(warpSum(r * r));
++        r *= fminf(rel_clip / (norm + 1e-6f), 1.0f);
++        if (lane < kRel) {
++            const uint16_t v = global ? tobf(bf(tobf(r)) * tau) : tobf(r);
++            rel_out[(static_cast<size_t>(row) * heads + y) * kRel + lane] = v;
++        }
++        return;
++    }
++    if (blockIdx.x >= n_streams) return;
++    const bool key = y < heads + kv_heads;
++    const int h = key ? y - heads : y - heads - kv_heads;
++    const int4 sg = conv_segs[blockIdx.x];
++    if (sg.y <= 0) return;
++    const int C = kv_heads * kDim;
++    const int c0 = h * kDim + lane * 4;
++    float* st = (key ? k_state : v_state) + static_cast<size_t>(sg.z) * 3 * C;
++    const uint16_t* w = key ? k_w : v_w;
++    const float* dyn = key ? k_dyn : v_dyn;
++    float* hist = key ? k_hist : v_hist;
++    const uint16_t* raw = key ? k_raw : v_raw;
++    float h0[4], h1[4], h2[4];
++    for (int i = 0; i < 4; ++i) {
++        h0[i] = st[c0 + i];
++        h1[i] = st[C + c0 + i];
++        h2[i] = st[2 * C + c0 + i];
++    }
++    for (int t = sg.x; t < sg.x + sg.y; ++t) {
++        const size_t at0 = static_cast<size_t>(t) * C + c0;
++        float x[4];
++        if (dyn) {
++            const float* d = dyn + (static_cast<size_t>(t) * kv_heads + h) * 4;
++            const float d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3];
++            for (int i = 0; i < 4; ++i) {
++                const int c = c0 + i;
++                const float xin = bf(raw[at0 + i]);
++                if (hist) hist[at0 + i] = xin;
++                float cy = __fadd_rn(__fmul_rn(__fadd_rn(bf(w[c]), d0), xin),
++                                     __fmul_rn(__fadd_rn(bf(w[C + c]), d1), h2[i]));
++                cy = __fadd_rn(cy, __fmul_rn(__fadd_rn(bf(w[2 * C + c]), d2), h1[i]));
++                cy = __fadd_rn(cy, __fmul_rn(__fadd_rn(bf(w[3 * C + c]), d3), h0[i]));
++                cy = __fdiv_rn(__fadd_rn(cy, xin), 3.0f);
++                x[i] = bf(tobf(cy));
++                h0[i] = h1[i];
++                h1[i] = h2[i];
++                h2[i] = xin;
++            }
++        } else {
++            for (int i = 0; i < 4; ++i) {
++                const uint16_t* wc = w + static_cast<size_t>(c0 + i) * 4;
++                const float xin = bf(raw[at0 + i]);
++                if (hist) hist[at0 + i] = xin;
++                float cy = __fadd_rn(__fmul_rn(bf(wc[0]), h0[i]), __fmul_rn(bf(wc[1]), h1[i]));
++                cy = __fadd_rn(cy, __fmul_rn(bf(wc[2]), h2[i]));
++                cy = __fadd_rn(cy, __fmul_rn(bf(wc[3]), xin));
++                cy = __fdiv_rn(__fadd_rn(cy, xin), 2.2360679774997896f);
++                x[i] = bf(tobf(cy));
++                h0[i] = h1[i];
++                h1[i] = h2[i];
++                h2[i] = xin;
++            }
++        }
++        if (key) {
++            clip(x, qk_clip);
++        } else {
++            const float r = rsqrtf(warpSum(x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3]) / kDim + eps);
++            for (int i = 0; i < 4; ++i) x[i] *= r;
++        }
++        const Seg s = segs[rseg[t]];
++        const size_t slot = static_cast<size_t>(h) * ring + rpos[t] % ring;
++        if constexpr (KV8) {
++            float amax = 0.0f;
++            for (int i = 0; i < 4; ++i) {
++                x[i] = bf(tobf(x[i]));
++                amax = fmaxf(amax, fabsf(x[i]));
++            }
++            amax = warpMax(amax);
++            const float sc = amax > 0.0f ? amax / 448.0f : 1.0f;
++            uint32_t word = 0;
++            for (int i = 0; i < 4; ++i) {
++                const __nv_fp8_e4m3 c(x[i] / sc);
++                word |= static_cast<uint32_t>(c.__x) << (8 * i);
++            }
++            uint8_t* dst = reinterpret_cast<uint8_t*>(key ? kc : vc) + s.off + slot * kDim;
++            reinterpret_cast<uint32_t*>(dst)[lane] = word;
++            if (lane == 0) (key ? ksc : vsc)[s.off / kDim + slot] = sc;
++        } else {
++            uint16_t* dst = (key ? kc : vc) + s.off + slot * kDim;
++            for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
++        }
++    }
++    for (int i = 0; i < 4; ++i) {
++        st[c0 + i] = h0[i];
++        st[C + c0 + i] = h1[i];
++        st[2 * C + c0 + i] = h2[i];
++    }
++}
++
+ }  // namespace ink2
+ 
+ using ink2::Seg;
+@@ -149,6 +277,11 @@ using ink2::Seg;
+ #define TF_INK2_PREP_PASS                                                                                          \
+     q_raw, k_raw, v_raw, rel_raw, q_scale, rel_scale, rpos, rseg, segs, q_out, rel_out, kc, vc, heads, kv_heads,   \
+         ring, global, qk_clip, rel_clip, floor_pos, alpha, eps
++#define TF_INK2_CONV_ARGS                                                                                          \
++    const int4 *__restrict__ conv_segs, int n_streams, float *__restrict__ k_state, float *__restrict__ v_state,   \
++        const uint16_t *__restrict__ k_w, const uint16_t *__restrict__ v_w, const float *__restrict__ k_dyn,       \
++        const float *__restrict__ v_dyn, float *__restrict__ k_hist, float *__restrict__ v_hist
++#define TF_INK2_CONV_PASS conv_segs, n_streams, k_state, v_state, k_w, v_w, k_dyn, v_dyn, k_hist, v_hist
+ 
+ extern "C" __global__ void tf_ink2_prep(TF_INK2_PREP_ARGS) {
+     ink2::prepRow<false>(TF_INK2_PREP_PASS, nullptr, nullptr);
+@@ -159,6 +292,15 @@ extern "C" __global__ void tf_ink2_prep8(TF_INK2_PREP_ARGS, float* __restrict__
+     ink2::prepRow<true>(TF_INK2_PREP_PASS, ksc, vsc);
+ }
+ 
++extern "C" __global__ void tf_ink2_prep_conv(TF_INK2_PREP_ARGS, TF_INK2_CONV_ARGS) {
++    ink2::prepConvRow<false>(TF_INK2_PREP_PASS, nullptr, nullptr, TF_INK2_CONV_PASS);
++}
++
++extern "C" __global__ void tf_ink2_prep_conv8(TF_INK2_PREP_ARGS, float* __restrict__ ksc, float* __restrict__ vsc,
++                                              TF_INK2_CONV_ARGS) {
++    ink2::prepConvRow<true>(TF_INK2_PREP_PASS, ksc, vsc, TF_INK2_CONV_PASS);
++}
++
+ // tab[row, head, d] = bf16(rel[row, head, :] . proj[:, d]) for d < 1024, fp32 sums in tap order (rel_logits_proj).
+ extern "C" __global__ void tf_ink2_rel_table(const uint16_t* __restrict__ rel, const uint16_t* __restrict__ proj,
+                                              uint16_t* __restrict__ tab) {
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 911dcd9ae..544132dc7 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -113,6 +113,8 @@ pub const Kernels = struct {
+     attn_prompt: cuda.Function,
+     // fp8 caches: the same launches with the scales after their arguments
+     prep8: cuda.Function,
++    prep_conv: cuda.Function,
++    prep_conv8: cuda.Function,
+     attn8: cuda.Function,
+     attn_fold8: cuda.Function,
+     attn_prompt8: cuda.Function,
+@@ -154,6 +156,8 @@ pub const Kernels = struct {
+             .attn_prompt8 = attn_prompt8,
+             .attn_prompt8_fast = attn_prompt8_fast,
+             .prep8 = try mod.function("tf_ink2_prep8"),
++            .prep_conv = try mod.function("tf_ink2_prep_conv"),
++            .prep_conv8 = try mod.function("tf_ink2_prep_conv8"),
+             .attn8 = try mod.function("tf_ink2_attn8"),
+             .attn_fold8 = try mod.function("tf_ink2_attn_fold8"),
+             .prep = try mod.function("tf_ink2_prep"),
+@@ -224,6 +228,39 @@ pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw:
+     try go(if (kv.fp8()) k.prep8 else k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
+ }
+ 
++/// Fused decode K/V conv + Q/rel/K/V prep in one launch (TF_INKLING2_DECODE_KV_CONV_PREP).
++pub const ConvPrep = struct {
++    conv_segs: u64,
++    n_streams: u32,
++    k_state: u64,
++    v_state: u64,
++    k_w: u64,
++    v_w: u64,
++    k_dyn: u64,
++    v_dyn: u64,
++    k_hist: u64,
++    v_hist: u64,
++};
++
++pub fn prepConv(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw: [4]u64, scales: [2]u64, q: u64, rel: u64, kv: Cache, cp: ConvPrep) !void {
++    try headsFit(r);
++    var a: cuda.Args = .{};
++    for (raw ++ scales ++ [_]u64{ r.pos, r.seg_of, r.segs, q, rel, kv.k, kv.v }) |v| a.add(v);
++    a.add(int(r.heads));
++    a.add(int(r.kv_heads));
++    a.add(int(l.ring));
++    a.add(int(@intFromBool(l.tau)));
++    for ([_]f32{ c.qk_clip, c.rel_clip, c.floor, c.alpha, c.eps }) |v| a.add(v);
++    if (kv.fp8()) {
++        a.add(kv.ks);
++        a.add(kv.vs);
++    }
++    a.add(cp.conv_segs);
++    a.add(int(cp.n_streams));
++    for ([_]u64{ cp.k_state, cp.v_state, cp.k_w, cp.v_w, cp.k_dyn, cp.v_dyn, cp.k_hist, cp.v_hist }) |v| a.add(v);
++    try go(if (kv.fp8()) k.prep_conv8 else k.prep_conv, s, .{ .x = @max(r.rows, cp.n_streams), .y = r.heads + 2 * r.kv_heads }, 32, &a);
++}
++
+ /// K and V only (written to caches at pos % ring); skips Q and rel when last-visit outputs are unread.
+ pub fn prepKvOnly(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, k_raw: u64, v_raw: u64, kv: Cache) !void {
+     try headsFit(r);
+diff --git a/zig/src/families/inkling2/mini_visit.zig b/zig/src/families/inkling2/mini_visit.zig
+index d66ef68ad..daa90426b 100644
+--- a/zig/src/families/inkling2/mini_visit.zig
++++ b/zig/src/families/inkling2/mini_visit.zig
+@@ -130,6 +130,15 @@ fn proj(m: *const Model, k: *const Kernels, s: cuda.Stream, w: cuda.qmmf.Weight,
+     try k.lane.matmulOut(s, x, w.k, n, w, out, .bf16, m.s.lane_part);
+ }
+ 
++/// TF_INKLING2_DECODE_KV_CONV_PREP=0: disable fused decode K/V conv + prep kernel.
++fn decodeKvConvPrepOn() bool {
++    const S = struct {
++        var v: ?bool = null;
++    };
++    if (S.v == null) S.v = if (std.c.getenv("TF_INKLING2_DECODE_KV_CONV_PREP")) |e| e[0] != '0' else true;
++    return S.v.?;
++}
++
+ /// TF_INKLING2_ATTN_FP8_TC=1 (P3, lossy, default off): FP8 tensor-core attention projections for prompt rows.
+ fn attnFp8TcOn() bool {
+     const S = struct {
+@@ -401,15 +410,30 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+         // the taps as torch's bf16 linear leaves them: float(bf16(sum)) times 1
+         try k.dense.rowsScaled(s, x, h, w, m.w.ones, m.s.dyn[side], taps, n, taps, h);
+     };
+-    for ([_]Site{ .k, .v }, [_]u64{ o.k, o.v }, [_]u64{ m.s.kc, m.s.vc }, [_]u64{ a.k_conv, a.v_conv }, 0..) |site, x, out, w, side| {
+-        try conv(m, k, s, r, v, site, .{ .x = x, .state = 0, .w = w, .dyn = if (global) m.s.dyn[side] else 0, .out = out, .x_bf16 = 1, .heads = @intCast(kvh), .c = @intCast(kvw), .rows = 0, .mode = 0 });
+-    }
+     // q, rel and the caches' new K and V rows, the bias table, then attention through the sink and the output gate
+     const l = if (global) m.full else m.sliding;
+     const rows: attn.Rows = .{ .rows = @intCast(n), .heads = t.local.q, .kv_heads = t.local.kv, .pos = m.s.pos, .seg_of = m.s.seg_of, .segs = m.s.segs[@intFromBool(global)], .tiles = m.s.tiles, .n_tiles = r.n_tiles, .last_pos = r.last_pos, .streams = @intCast(r.streams) };
+     const cache: attn.Cache = .{ .k = m.kv[0][v], .v = m.kv[1][v], .ks = m.kvs[0][v], .vs = m.kvs[1][v] };
+     const prep: attn.Prep = .{ .qk_clip = t.qk_clip, .rel_clip = t.rel_clip, .floor = @floatFromInt(t.log_floor), .alpha = t.log_alpha, .eps = t.eps };
+-    try attn.prep(&k.attn, s, rows, l, prep, .{ o.q, m.s.kc, m.s.vc, o.rel }, .{ a.q_scale, a.rel_scale }, m.s.qp, m.s.relp, cache);
++    if (!r.prompt and decodeKvConvPrepOn()) {
++        try attn.prepConv(&k.attn, s, rows, l, prep, .{ o.q, o.k, o.v, o.rel }, .{ a.q_scale, a.rel_scale }, m.s.qp, m.s.relp, cache, .{
++            .conv_segs = m.s.conv_segs,
++            .n_streams = @intCast(r.streams),
++            .k_state = m.conv[v][@intFromEnum(Site.k)],
++            .v_state = m.conv[v][@intFromEnum(Site.v)],
++            .k_w = a.k_conv,
++            .v_w = a.v_conv,
++            .k_dyn = if (global) m.s.dyn[0] else 0,
++            .v_dyn = if (global) m.s.dyn[1] else 0,
++            .k_hist = if (m.hist_on) m.hist[v][@intFromEnum(Site.k)] else 0,
++            .v_hist = if (m.hist_on) m.hist[v][@intFromEnum(Site.v)] else 0,
++        });
++    } else {
++        for ([_]Site{ .k, .v }, [_]u64{ o.k, o.v }, [_]u64{ m.s.kc, m.s.vc }, [_]u64{ a.k_conv, a.v_conv }, 0..) |site, x, out, w, side| {
++            try conv(m, k, s, r, v, site, .{ .x = x, .state = 0, .w = w, .dyn = if (global) m.s.dyn[side] else 0, .out = out, .x_bf16 = 1, .heads = @intCast(kvh), .c = @intCast(kvw), .rows = 0, .mode = 0 });
++        }
++        try attn.prep(&k.attn, s, rows, l, prep, .{ o.q, m.s.kc, m.s.vc, o.rel }, .{ a.q_scale, a.rel_scale }, m.s.qp, m.s.relp, cache);
++    }
+     try attn.relTable(&k.attn, s, rows, m.s.relp, a.rel_proj, m.s.tab);
+     const stride = attn.slotsFor(l, m.context);
+     try attn.attend(&k.attn, s, rows, l, stride, m.s.entries, m.s.qp, cache, m.s.tab, m.s.part_o, m.s.part_ml, o.sink, o.gate, m.s.att);
+-- 
+2.43.0
+

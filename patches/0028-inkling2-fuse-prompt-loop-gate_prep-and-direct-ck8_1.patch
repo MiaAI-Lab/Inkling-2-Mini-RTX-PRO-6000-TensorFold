@@ -1,0 +1,285 @@
+From 6e7378425b09285303ac17b87e48d07e60af26b3 Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 11:28:42 +0200
+Subject: [PATCH] inkling2: fuse prompt loop gate_prep and direct ck8_128_row
+ plane stores (after PR #6)
+
+1. Fuse prompt rank-64 loop gate_prep normalization into
+   tf_ink2_loop_gate_down_rows (after plotarmordev PR #6), eliminating
+   the separate gate_prep launch and [rows, 2H] BF16 round-trip.
+2. Add tf_ck8_128_row_split in ck_lane.cu to write the 4 or 6 fused
+   prompt attention planes directly from registers when
+   TF_INKLING2_ATTN_FP8_TC=1, eliminating m.s.fused staging and the
+   tf_ink2_split_cols launch.
+---
+ zig/kernels/cuda/ck_lane.cu              | 30 ++++++++++++++++++--
+ zig/kernels/cuda/inkling2/loop.cu        | 35 +++++++++++++++++++++---
+ zig/src/families/inkling2/loop.zig       | 26 ++++++++++++------
+ zig/src/families/inkling2/mini_model.zig |  3 ++
+ zig/src/families/inkling2/mini_visit.zig | 28 +++++++++++++++++--
+ 5 files changed, 104 insertions(+), 18 deletions(-)
+
+diff --git a/zig/kernels/cuda/ck_lane.cu b/zig/kernels/cuda/ck_lane.cu
+index 031032a73..e7bfffa48 100644
+--- a/zig/kernels/cuda/ck_lane.cu
++++ b/zig/kernels/cuda/ck_lane.cu
+@@ -32,11 +32,17 @@ struct Tile {
+ 
+ #include "common/unpack8_value.cuh"
+ 
++struct SplitCols {
++    uint16_t* dst[6];
++    int off[6], w[6], n;
++};
++
+ // x e4m3 [M, K] and w e4m3 [npad/64, K/64, 8, 32, 2, 8], both in the fragment order quant8 and the FP8 pack write.
+-template <typename C, bool CLUSTER, bool ROW_SCALE = false>
++template <typename C, bool CLUSTER, bool ROW_SCALE = false, bool SPLIT = false>
+ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float alpha,
+                                      __nv_bfloat16* __restrict__ out, float* __restrict__ part, int M, int N, int K,
+-                                     int SK, int group, const float* __restrict__ row_scales = nullptr) {
++                                     int SK, int group, const float* __restrict__ row_scales = nullptr,
++                                     const SplitCols* split = nullptr) {
+     using T = Tile<C, CLUSTER>;
+     constexpr int THREADS = C::THREADS, CH = T::ROW / 16;
+     extern __shared__ __align__(128) unsigned char buf[];
+@@ -103,6 +109,17 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
+     wait<0>();
+     __syncthreads();
+     auto put = [&](int row, int col, float v0, float v1) {
++        if constexpr (SPLIT) {
++            if (col >= N) return;
++            int plane = 0;
++            for (; plane < split->n; ++plane)
++                if (col >= split->off[plane] && col < split->off[plane] + split->w[plane]) break;
++            if (plane == split->n) return;
++            __nv_bfloat16* dst = reinterpret_cast<__nv_bfloat16*>(split->dst[plane]) +
++                                 static_cast<size_t>(row) * split->w[plane] + (col - split->off[plane]);
++            *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
++            return;
++        }
+         __nv_bfloat16* dst = out + static_cast<size_t>(row) * N + col;
+         if (col + 1 < N && (N & 1) == 0) {
+             *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+@@ -191,6 +208,15 @@ extern "C" __global__ void __launch_bounds__(256)
+                                                                row_scales);
+ }
+ 
++// Direct 4/6-plane consumer stores from tf_ck8_128_row (eliminates m.s.fused staging and tf_ink2_split_cols).
++extern "C" __global__ void __launch_bounds__(256)
++    tf_ck8_128_row_split(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float w_scale,
++                         const float* __restrict__ row_scales, int M, int N, int K, int group,
++                         const tf_ck::SplitCols split) {
++    tf_ck::lane<tf_ck::Cfg<128, 128, 2, 4, true>, false, true, true>(x, w, w_scale, nullptr, nullptr, M, N, K, 1,
++                                                                     group, row_scales, &split);
++}
++
+ // P3: Per-row e4m3 quantization into fragment order (1 block of 256 threads per row).
+ extern "C" __global__ void __launch_bounds__(256)
+     tf_ck_quant8_row(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, uint8_t* __restrict__ out,
+diff --git a/zig/kernels/cuda/inkling2/loop.cu b/zig/kernels/cuda/inkling2/loop.cu
+index 9e2f5b6f8..63a982fae 100644
+--- a/zig/kernels/cuda/inkling2/loop.cu
++++ b/zig/kernels/cuda/inkling2/loop.cu
+@@ -226,6 +226,8 @@ constexpr int kDC = 256;
+ extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_down_rows(const LoopGateArgs a, const uint16_t* xs) {
+     __shared__ __align__(16) uint16_t sx[kDR][kDC];
+     __shared__ __align__(16) uint16_t sw[kWarps * kDK][kDC];
++    __shared__ float red[kWarps];
++    __shared__ float inv[kDR][2];
+     const int g = blockIdx.y, H = a.H, R = a.rank, H2 = 2 * H;
+     const size_t row0 = static_cast<size_t>(blockIdx.x) * kDR;
+     const int nr = min(kDR, a.rows - static_cast<int>(row0));
+@@ -237,16 +239,41 @@ extern "C" __global__ void __launch_bounds__(kThreads) tf_ink2_loop_gate_down_ro
+     for (int k = 0; k < kDK; ++k)
+ #pragma unroll
+         for (int j = 0; j < kDR; ++j) acc[k][j] = 0.0f;
+-    const uint16_t* x0 = xs + (static_cast<size_t>(g) * a.rows + row0) * H2;
++    // Prompt-only fusion: normalize inside the down CTA instead of writing/reading BF16 [rows, 2H] through ys.
++    if (!xs) {
++        for (int j = 0; j < nr; ++j) {
++            const float* h = a.h[g] + (row0 + j) * H;
++            const float* m = a.msg + a.slot[g] * a.msg_stride + (row0 + j) * H;
++            float sh_acc = 0.0f, sm_acc = 0.0f;
++            for (int i = threadIdx.x; i < H; i += kThreads) {
++                sh_acc = fmaf(h[i], h[i], sh_acc);
++                sm_acc = fmaf(m[i], m[i], sm_acc);
++            }
++            const float ih = rsqrtf(blockSum(sh_acc, red) / static_cast<float>(H) + a.eps_unit);
++            const float im = rsqrtf(blockSum(sm_acc, red) / static_cast<float>(H) + a.eps_unit);
++            if (threadIdx.x == 0) { inv[j][0] = ih; inv[j][1] = im; }
++        }
++        __syncthreads();
++    }
++    const uint16_t* x0 = xs ? xs + (static_cast<size_t>(g) * a.rows + row0) * H2 : nullptr;
+     const uint16_t* w0 = a.down_w[g] + static_cast<size_t>(rb) * H2;
+     constexpr int V = kDC / 8;  // uint4 per staged row
+     for (int c0 = 0; c0 < H2; c0 += kDC) {
+         __syncthreads();
+         for (int e = threadIdx.x; e < kDR * V; e += kThreads) {
+             const int j = e / V, v = e - j * V;
+-            uint4 val = make_uint4(0, 0, 0, 0);
+-            if (j < nr) val = *reinterpret_cast<const uint4*>(x0 + static_cast<size_t>(j) * H2 + c0 + v * 8);
+-            *reinterpret_cast<uint4*>(&sx[j][v * 8]) = val;
++            if (j < nr && !xs) {
++                const float* h = a.h[g] + (row0 + j) * H;
++                const float* m = a.msg + a.slot[g] * a.msg_stride + (row0 + j) * H;
++                for (int b = 0; b < 8; ++b) {
++                    const int c = c0 + v * 8 + b;
++                    sx[j][v * 8 + b] = c < H ? tobf(h[c] * inv[j][0]) : tobf(m[c - H] * inv[j][1]);
++                }
++            } else {
++                uint4 val = make_uint4(0, 0, 0, 0);
++                if (j < nr) val = *reinterpret_cast<const uint4*>(x0 + static_cast<size_t>(j) * H2 + c0 + v * 8);
++                *reinterpret_cast<uint4*>(&sx[j][v * 8]) = val;
++            }
+         }
+         for (int e = threadIdx.x; e < kWarps * kDK * V; e += kThreads) {
+             const int k = e / V, v = e - k * V;
+diff --git a/zig/src/families/inkling2/loop.zig b/zig/src/families/inkling2/loop.zig
+index 9fdfd6baa..519f2a5b0 100644
+--- a/zig/src/families/inkling2/loop.zig
++++ b/zig/src/families/inkling2/loop.zig
+@@ -126,8 +126,14 @@ pub fn mixLayers(k: *const Kernels, s: cuda.Stream, a: MixArgs, layers: usize, q
+ 
+ /// The gates' rank-r down rows, then the gated, normed inputs: a block a (row, gate) each.
+ pub fn gates(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize) !void {
+-    if (k.tiled and check.on()) return check.run(k, s, a, n);
+-    return gatesWith(k, k.tiled, s, a, n);
++    if (k.tiled and check.on()) return check.run(k, s, a, n, false);
++    return gatesWith(k, k.tiled, s, a, n, false);
++}
++
++/// Prompt-only fusion: prepare each gate's unit-normalized state/message inside the row-tiled down CTA.
++pub fn gatesPrefill(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize) !void {
++    if (k.tiled and check.on()) return check.run(k, s, a, n, true);
++    return gatesWith(k, k.tiled, s, a, n, true);
+ }
+ 
+ /// TF_INKLING2_LOOP_CHECK=1 (ungraphed only): each gates call runs the original kernels, then the tiled ones, and compares
+@@ -159,12 +165,12 @@ const check = struct {
+         try s.d.check(s.d.api.cuMemcpyDtoH_v2(buf[n * plane ..].ptr, a.down, down), "dtoh");
+         return buf;
+     }
+-    fn run(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize) !void {
++    fn run(k: *const Kernels, s: cuda.Stream, a: GateArgs, n: usize, prefill: bool) !void {
+         const gpa = std.heap.page_allocator;
+-        try gatesWith(k, false, s, a, n);
++        try gatesWith(k, false, s, a, n, false);
+         const want = try grab(s, gpa, a, n);
+         defer gpa.free(want);
+-        try gatesWith(k, true, s, a, n);
++        try gatesWith(k, true, s, a, n, prefill);
+         const got = try grab(s, gpa, a, n);
+         defer gpa.free(got);
+         const split = want.len - n * @as(usize, @intCast(a.rows)) * @as(usize, @intCast(a.rank)) * 2;
+@@ -176,7 +182,7 @@ const check = struct {
+     }
+ };
+ 
+-fn gatesWith(k: *const Kernels, tiled: bool, s: cuda.Stream, a: GateArgs, n: usize) !void {
++fn gatesWith(k: *const Kernels, tiled: bool, s: cuda.Stream, a: GateArgs, n: usize, prefill: bool) !void {
+     try gateFits(a, n);
+     var args: cuda.Args = .{};
+     args.add(a);
+@@ -186,11 +192,13 @@ fn gatesWith(k: *const Kernels, tiled: bool, s: cuda.Stream, a: GateArgs, n: usi
+     const rows: u32 = @intCast(a.rows);
+     const rank: u32 = @intCast(a.rank);
+     if (tiled and rows >= tiled_down_min_rows and @as(u32, @intCast(2 * a.h_dim)) % 256 == 0) {
+-        // xs (bf16 [gates][rows][2H]) borrows ys, which gate_lin writes only after gate_down has read it
++        // xs (bf16 [gates][rows][2H]) borrows ys, which gate_lin writes only after gate_down has read it.
++        // Only prompt rank-64 gates have one rank CTA per row tile, so the fused norm is computed once.
++        const fused = prefill and rank == 64 and h % 8 == 0;
+         var pa: cuda.Args = .{};
+         pa.add(a);
+-        pa.add(a.ys);
+-        try cuda.launch.launch(k.gate_prep, .{ .grid = grid, .block = .{ .x = threads } }, s, &pa);
++        pa.add(if (fused) @as(u64, 0) else a.ys);
++        if (!fused) try cuda.launch.launch(k.gate_prep, .{ .grid = grid, .block = .{ .x = threads } }, s, &pa);
+         const dg: cuda.Dim3 = .{ .x = std.math.divCeil(u32, rows, down_rows) catch unreachable, .y = grid.y, .z = std.math.divCeil(u32, rank, down_ranks) catch unreachable };
+         try cuda.launch.launch(k.gate_down_rows, .{ .grid = dg, .block = .{ .x = threads } }, s, &pa);
+     } else {
+diff --git a/zig/src/families/inkling2/mini_model.zig b/zig/src/families/inkling2/mini_model.zig
+index df7420b23..fbda9cd3b 100644
+--- a/zig/src/families/inkling2/mini_model.zig
++++ b/zig/src/families/inkling2/mini_model.zig
+@@ -58,6 +58,7 @@ pub const Kernels = struct {
+     ck_mod: cuda.Module, // ck_lane.cu: P3 FP8 tensor-core prompt projections with per-row scaling
+     ck_quant8_row: cuda.Function,
+     ck8_128_row: cuda.Function,
++    ck8_128_row_split: cuda.Function,
+ 
+     pub fn load(ctx: *const cuda.Context) !Kernels {
+         const d = ctx.d;
+@@ -100,6 +101,8 @@ pub const Kernels = struct {
+         k.ck_quant8_row = try k.ck_mod.function("tf_ck_quant8_row");
+         k.ck8_128_row = try k.ck_mod.function("tf_ck8_128_row");
+         try k.ck8_128_row.allowDynamicShared(65536);
++        k.ck8_128_row_split = try k.ck_mod.function("tf_ck8_128_row_split");
++        try k.ck8_128_row_split.allowDynamicShared(65536);
+         return k;
+     }
+ 
+diff --git a/zig/src/families/inkling2/mini_visit.zig b/zig/src/families/inkling2/mini_visit.zig
+index daa90426b..13dab6e12 100644
+--- a/zig/src/families/inkling2/mini_visit.zig
++++ b/zig/src/families/inkling2/mini_visit.zig
+@@ -175,6 +175,22 @@ fn projTc(k: *const Kernels, s: cuda.Stream, w: cuda.qmmf.Weight, x8: u64, xsc:
+     try cuda.launch.launch(k.ck8_128_row, .{ .grid = .{ .x = @intCast(rows_t * cols_t) }, .block = .{ .x = 256 }, .shared = 65536 }, s, &a);
+ }
+ 
++fn projTcSplit(k: *const Kernels, s: cuda.Stream, w: cuda.qmmf.Weight, x8: u64, xsc: u64, n: usize, sc: ops.SplitCols) !void {
++    const bm: usize = 128;
++    const bn: usize = 128;
++    const rows_t = (n + bm - 1) / bm;
++    const cols_t = (w.n + bn - 1) / bn;
++    const group = @max(1, @min(rows_t, (12 << 20) / (bm * w.k)));
++    var a: cuda.Args = .{};
++    a.add(x8);
++    a.add(w.codes);
++    a.add(w.scale);
++    a.add(xsc);
++    for ([_]usize{ n, w.n, w.k, group }) |v| a.add(@as(i32, @intCast(v)));
++    a.add(sc);
++    try cuda.launch.launch(k.ck8_128_row_split, .{ .grid = .{ .x = @intCast(rows_t * cols_t) }, .block = .{ .x = 256 }, .shared = 65536 }, s, &a);
++}
++
+ fn projPrompt(m: *const Model, k: *const Kernels, s: cuda.Stream, prompt: bool, w: cuda.qmmf.Weight, x: u64, out: u64, n: usize) !void {
+     if (prompt and w.mode == .fp8 and attnFp8TcOn() and n >= 64 and w.k % 64 == 0) {
+         try quant8Row(k, s, x, n, w.k, m.s.x_tc_codes, m.s.x_tc_scales);
+@@ -258,7 +274,7 @@ fn gated(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, nb: usize
+         g.gain[i] = ctl[i].gain;
+         g.norm[i] = norms[i];
+     }
+-    try loop.gates(&k.loop, s, g, ctl.len);
++    if (r.prompt) try loop.gatesPrefill(&k.loop, s, g, ctl.len) else try loop.gates(&k.loop, s, g, ctl.len);
+ }
+ 
+ /// A short conv at `site` of visit `v` over the call's streams (their states by slot).
+@@ -381,7 +397,6 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+         // then each part copied to the plane its consumers read
+         const f = wts.Fused.of(t);
+         const ld: usize = if (separate) f.qx else f.all;
+-        try projPrompt(m, k, s, r.prompt, if (separate) a.qx else a.all, xq, m.s.fused, n);
+         const qw: usize = @as(usize, t.local.q) * t.local.dim;
+         var sc: ops.SplitCols = .{ .n = if (separate) 4 else 6 };
+         const parts = [6]struct { u64, usize, usize }{ .{ o.q, f.q, qw }, .{ o.gate, f.gate, qw }, .{ o.rel, f.rel, @as(usize, t.local.q) * t.d_rel }, .{ o.sink, f.sink, t.local.q }, .{ o.k, f.k, kvWidth(m) }, .{ o.v, f.v, kvWidth(m) } };
+@@ -390,7 +405,14 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+             sc.off[pi] = @intCast(pt[1]);
+             sc.w[pi] = @intCast(pt[2]);
+         }
+-        try ops.splitCols(&k.ops, s, m.s.fused, ld, n, sc);
++        const weight = if (separate) a.qx else a.all;
++        if (r.prompt and weight.mode == .fp8 and attnFp8TcOn() and n >= 64 and weight.k % 64 == 0) {
++            try quant8Row(k, s, xq, n, weight.k, m.s.x_tc_codes, m.s.x_tc_scales);
++            try projTcSplit(k, s, weight, m.s.x_tc_codes, m.s.x_tc_scales, n, sc);
++        } else {
++            try projPrompt(m, k, s, r.prompt, weight, xq, m.s.fused, n);
++            try ops.splitCols(&k.ops, s, m.s.fused, ld, n, sc);
++        }
+         if (separate) {
+             try projPrompt(m, k, s, r.prompt, a.wk, xk, o.k, n);
+             try projPrompt(m, k, s, r.prompt, a.wv, xv, o.v, n);
+-- 
+2.43.0
+

@@ -1,0 +1,313 @@
+From 7defca9c7d8e24b33551407167fbc3144731f35d Mon Sep 17 00:00:00 2001
+From: MiaAI Lab <83042094+MiaAI-Lab@users.noreply.github.com>
+Date: Fri, 27 Nov 2026 00:52:16 +0200
+Subject: [PATCH] inkling2: P1 skip expired DFlash2 prompt ingest and unread
+ last-visit prompt rows (TF_INKLING2_PROMPT_TRIM)
+
+---
+ zig/src/families/inkling2/kernels.zig      | 34 ++++++++
+ zig/src/families/inkling2/mini_backend.zig | 19 +++++
+ zig/src/families/inkling2/mini_dflash.zig  | 26 ++++++
+ zig/src/families/inkling2/mini_model.zig   |  5 ++
+ zig/src/families/inkling2/mini_native.zig  |  2 +
+ zig/src/families/inkling2/mini_visit.zig   | 99 ++++++++++++++++++++--
+ 6 files changed, 179 insertions(+), 6 deletions(-)
+
+diff --git a/zig/src/families/inkling2/kernels.zig b/zig/src/families/inkling2/kernels.zig
+index 06c829e55..83fd50a4e 100644
+--- a/zig/src/families/inkling2/kernels.zig
++++ b/zig/src/families/inkling2/kernels.zig
+@@ -216,6 +216,40 @@ pub fn prep(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, raw:
+     try go(if (kv.fp8()) k.prep8 else k.prep, s, .{ .x = r.rows, .y = r.heads + 2 * r.kv_heads }, 32, &a);
+ }
+ 
++/// K and V only (written to caches at pos % ring); skips Q and rel when last-visit outputs are unread.
++pub fn prepKvOnly(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, k_raw: u64, v_raw: u64, kv: Cache) !void {
++    try headsFit(r);
++    var a: cuda.Args = .{};
++    for ([_]u64{ 0, k_raw, v_raw, 0, 0, 0, r.pos, r.seg_of, r.segs, 0, 0, kv.k, kv.v }) |v| a.add(v);
++    a.add(int(0));
++    a.add(int(r.kv_heads));
++    a.add(int(l.ring));
++    a.add(int(@intFromBool(l.tau)));
++    for ([_]f32{ c.qk_clip, c.rel_clip, c.floor, c.alpha, c.eps }) |v| a.add(v);
++    if (kv.fp8()) {
++        a.add(kv.ks);
++        a.add(kv.vs);
++    }
++    try go(if (kv.fp8()) k.prep8 else k.prep, s, .{ .x = r.rows, .y = 2 * r.kv_heads }, 32, &a);
++}
++
++/// Q and rel only (after prepKvOnly has already written the K/V caches).
++pub fn prepQOnly(k: *const Kernels, s: cuda.Stream, r: Rows, l: Layer, c: Prep, q_raw: u64, rel_raw: u64, scales: [2]u64, q: u64, rel: u64, kv: Cache) !void {
++    try headsFit(r);
++    var a: cuda.Args = .{};
++    for ([_]u64{ q_raw, 0, 0, rel_raw, scales[0], scales[1], r.pos, r.seg_of, r.segs, q, rel, 0, 0 }) |v| a.add(v);
++    a.add(int(r.heads));
++    a.add(int(r.kv_heads));
++    a.add(int(l.ring));
++    a.add(int(@intFromBool(l.tau)));
++    for ([_]f32{ c.qk_clip, c.rel_clip, c.floor, c.alpha, c.eps }) |v| a.add(v);
++    if (kv.fp8()) {
++        a.add(@as(u64, 0));
++        a.add(@as(u64, 0));
++    }
++    try go(if (kv.fp8()) k.prep8 else k.prep, s, .{ .x = r.rows, .y = r.heads }, 32, &a);
++}
++
+ /// The bias table of each (row, head): its rel vector against the layer's rel_logits_proj [16][1024].
+ pub fn relTable(k: *const Kernels, s: cuda.Stream, r: Rows, rel: u64, proj: u64, tab: u64) !void {
+     var a: cuda.Args = .{};
+diff --git a/zig/src/families/inkling2/mini_backend.zig b/zig/src/families/inkling2/mini_backend.zig
+index 96b91e577..2baf57767 100644
+--- a/zig/src/families/inkling2/mini_backend.zig
++++ b/zig/src/families/inkling2/mini_backend.zig
+@@ -398,6 +398,12 @@ pub const Mini = struct {
+         snap.drop(x.gpa, x.s, k);
+     }
+ 
++    /// TF_INKLING2_PROMPT_TRIM=0: disable skipping unread last-visit prompt rows and expired drafter context.
++    fn promptTrimOn() bool {
++        const v = std.c.getenv("TF_INKLING2_PROMPT_TRIM") orelse return true;
++        return v[0] != '0';
++    }
++
+     /// One chunk from `l.fill`; true once the prompt's last row is in.
+     fn chunk(x: *Mini, s: *Stream, l: *Lane) !bool {
+         const p = s.prompt();
+@@ -411,6 +417,19 @@ pub const Mini = struct {
+         x.m.vision_slot = if (s.images.len > 0) l.slot else null;
+         x.m.vision_p0 = at;
+         defer x.m.vision_slot = null;
++        if (promptTrimOn() and (!x.m.taps_on or x.m.drafter_window != null)) {
++            var keep_from: usize = end -| 8;
++            if (x.m.taps_on) if (x.m.drafter_window) |w| {
++                keep_from = @min(keep_from, p.len -| (w + 8));
++            };
++            keep_from = @max(keep_from, at);
++            x.m.last_visit_tail0 = keep_from - at;
++            x.m.skip_final_taps = !done and x.m.taps_on and x.m.drafter_window != null and end <= p.len -| x.m.drafter_window.?;
++        }
++        defer {
++            x.m.last_visit_tail0 = 0;
++            x.m.skip_final_taps = false;
++        }
+         try x.m.forward(x.k, x.s, &.{.{ .slot = l.slot, .p0 = at, .tokens = p[at..end] }}, true, end - at - 1, @intFromBool(done));
+         if (done) try x.d.check(x.d.api.cuMemcpyDtoDAsync_v2(l.last, x.m.s.logits, x.vocab() * 4, x.s.handle), "cuMemcpyDtoDAsync");
+         if (x.m.taps_on) {
+diff --git a/zig/src/families/inkling2/mini_dflash.zig b/zig/src/families/inkling2/mini_dflash.zig
+index f16be42a0..069bd199e 100644
+--- a/zig/src/families/inkling2/mini_dflash.zig
++++ b/zig/src/families/inkling2/mini_dflash.zig
+@@ -708,6 +708,10 @@ pub const Drafter = struct {
+         }
+     }
+ 
++    fn promptTrimOn() bool {
++        return envOn("TF_INKLING2_PROMPT_TRIM");
++    }
++
+     fn absorbFn(ptr: *anyopaque, items: []const dr.Absorb) anyerror!void {
+         const x = self(ptr);
+         for (items) |item| {
+@@ -717,6 +721,28 @@ pub const Drafter = struct {
+             if (item.rows != null) return error.TreesNotBuilt;
+             if (f.rows == 0) continue;
+             if (x.chances) x.observe(l, item);
++            if (item.prompt and promptTrimOn()) {
++                const plen = item.stream.prompt().len;
++                const live_from: u64 = plen -| window;
++                const item_end = item.start + f.rows;
++                if (item_end <= live_from) {
++                    l.from = @max(l.from, item_end);
++                    l.end = item_end;
++                    l.held = 0;
++                    l.fetched = false;
++                    continue;
++                }
++                const want_start = @max(item.start, live_from);
++                const skip: usize = @intCast(want_start - item.start);
++                const n: usize = f.rows - skip;
++                if (item.start > l.end or l.end == 0) l.from = want_start else l.from = @max(l.from, live_from);
++                const sl = &x.slots.items[l.slot];
++                try x.ingest(sl.ring, f.buffer + f.offset + skip * row_bytes, want_start, n);
++                l.end = item_end;
++                l.held = 0;
++                l.fetched = false;
++                continue;
++            }
+             if (item.start > l.end or l.end == 0) l.from = item.start; // a gap (a resumed prompt): attend from here
+             const sl = &x.slots.items[l.slot];
+             // only the last window of rows can be attended to: earlier ones would be overwritten in the ring
+diff --git a/zig/src/families/inkling2/mini_model.zig b/zig/src/families/inkling2/mini_model.zig
+index f79cafeda..ad5f5b8b1 100644
+--- a/zig/src/families/inkling2/mini_model.zig
++++ b/zig/src/families/inkling2/mini_model.zig
+@@ -209,6 +209,11 @@ pub const Model = struct {
+     /// The taps of the last forward's rows, bf16 [prompt_rows][taps_n][H], written once `taps_on`.
+     taps: u64 = 0,
+     taps_on: bool = false,
++    /// DFlash2's fixed context window (null when DSpark is attached, which reads full-prompt taps).
++    drafter_window: ?usize = null,
++    /// Prompt trim (P1): first row in the active prompt chunk that needs the full last visit, and whether all taps expire.
++    last_visit_tail0: usize = 0,
++    skip_final_taps: bool = false,
+     /// Forwards run so far: a view of `taps` or `hist` is valid only within its forward's generation.
+     gen: u64 = 0,
+     /// Optional vision tower/image rows manager and the active prompt chunk's slot & starting position.
+diff --git a/zig/src/families/inkling2/mini_native.zig b/zig/src/families/inkling2/mini_native.zig
+index 12ea7dda6..4dff1ad7f 100644
+--- a/zig/src/families/inkling2/mini_native.zig
++++ b/zig/src/families/inkling2/mini_native.zig
+@@ -130,9 +130,11 @@ pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []con
+     if (own.b.lanes.count() != 0) return error.TapsAfterStreams;
+     if (dflash.isDFlash2(gpa, io, dir)) {
+         const d = try dflash.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
++        own.m.drafter_window = dflash.window;
+         std.log.info("Inkling 2 Mini DFlash2: {d} drafts a block from {s} (Apache-2.0), {s} head, chances {s}, {d:.2} GiB fixed, {d:.2} GiB a stream", .{ dflash.depth, dir, if (d.head) |h| (if (h.mode == .fp4) "nvfp4" else "fp8") else "bf16", if (d.chances) "lone streams" else "off", gib(d.fixedBytes()), gib(dflash.laneBytes()) });
+         return .{ .drafter = d.drafter(), .ctx = d, .close = closeDFlash, .reserve = reserveDFlash };
+     }
++    own.m.drafter_window = null;
+     const d = try dspark.Drafter.init(gpa, io, own.m.d, own.s, &own.w, &own.k, own.m.context, dir);
+     std.log.info("Inkling 2 Mini DSpark: {d} drafts a block from {s}, bf16 weights (--drafter-bits {d} serves bf16), {d:.2} GiB fixed, {d:.2} GiB a stream", .{ dspark.depth, dir, bits, gib(d.fixedBytes()), gib(dspark.laneBytes(own.m.context)) });
+     return .{ .drafter = d.drafter(), .ctx = d, .close = closeDrafter, .reserve = reserveDrafter };
+diff --git a/zig/src/families/inkling2/mini_visit.zig b/zig/src/families/inkling2/mini_visit.zig
+index e116ace64..2ae7e7eb6 100644
+--- a/zig/src/families/inkling2/mini_visit.zig
++++ b/zig/src/families/inkling2/mini_visit.zig
+@@ -21,6 +21,8 @@ pub const Rows = struct {
+     prompt: bool,
+     last_pos: u32,
+     n_tiles: u32,
++    prompt_slot: usize = 0,
++    prompt_p0: usize = 0,
+ 
+     /// Ids, positions, segments and tiles of `chains` uploaded on `s`.
+     pub fn stage(m: *Model, s: cuda.Stream, chains: []const mm.Chain, rows: usize, prompt: bool) !Rows {
+@@ -55,7 +57,34 @@ pub const Rows = struct {
+         for (0..2) |side| try m.upload(s, m.s.segs[side], std.mem.sliceAsBytes(segs[side][0..chains.len]));
+         try m.upload(s, m.s.conv_segs, std.mem.sliceAsBytes(cs[0..chains.len]));
+         try m.upload(s, m.s.tiles, std.mem.sliceAsBytes(tiles[0..n_tiles]));
+-        return .{ .n = rows, .streams = chains.len, .prompt = prompt, .last_pos = last, .n_tiles = @intCast(n_tiles) };
++        return .{ .n = rows, .streams = chains.len, .prompt = prompt, .last_pos = last, .n_tiles = @intCast(n_tiles), .prompt_slot = chains[0].slot, .prompt_p0 = chains[0].p0 };
++    }
++
++    /// Stage a tail sub-range [p0, p0 + rows) of one prompt stream (used by P1 last-visit trim).
++    fn stageTail(m: *Model, s: cuda.Stream, slot: usize, p0: usize, rows: usize) !Rows {
++        const gpa = m.gpa;
++        const ints = try gpa.alloc(i32, 2 * rows);
++        defer gpa.free(ints);
++        for (0..rows) |j| {
++            ints[j] = @intCast(p0 + j);
++            ints[rows + j] = 0;
++        }
++        const kvw: i64 = @as(i64, m.c.local.kv) * m.c.local.dim;
++        const slot_i: i64 = @intCast(slot);
++        var segs: [2][1]attn.Seg = undefined;
++        for ([_]attn.Layer{ m.sliding, m.full }, 0..) |l, side| {
++            segs[side][0] = .{ .row0 = 0, .n = @intCast(rows), .p0 = @intCast(p0), .off = slot_i * kvw * l.ring };
++        }
++        const cs = [1][4]i32{.{ 0, @intCast(rows), @intCast(slot), 0 }};
++        const group = m.c.local.q / m.c.local.kv;
++        var tiles: [attn.tileCount(mm.prompt_rows, 3) + 1]attn.Tile = undefined;
++        const n_tiles = try attn.tiles(segs[0][0..1], group, &tiles);
++        try m.upload(s, m.s.pos, std.mem.sliceAsBytes(ints[0..rows]));
++        try m.upload(s, m.s.seg_of, std.mem.sliceAsBytes(ints[rows .. 2 * rows]));
++        for (0..2) |side| try m.upload(s, m.s.segs[side], std.mem.sliceAsBytes(segs[side][0..1]));
++        try m.upload(s, m.s.conv_segs, std.mem.sliceAsBytes(cs[0..1]));
++        try m.upload(s, m.s.tiles, std.mem.sliceAsBytes(tiles[0..n_tiles]));
++        return .{ .n = rows, .streams = 1, .prompt = true, .last_pos = @intCast(p0 + rows - 1), .n_tiles = @intCast(n_tiles), .prompt_slot = slot, .prompt_p0 = p0 };
+     }
+ };
+ 
+@@ -73,15 +102,17 @@ pub fn run(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, head0:
+     };
+     var cur: usize = 0;
+     for (0..m.w.plan.visits.len) |v| {
+-        if (m.taps_on) if (std.mem.indexOfScalar(u32, &mm.tap_visits, @intCast(v))) |tp| try m.tap(k, s, m.s.h[cur], r.n, tp);
++        if (m.taps_on and !m.skip_final_taps) if (std.mem.indexOfScalar(u32, &mm.tap_visits, @intCast(v))) |tp| try m.tap(k, s, m.s.h[cur], r.n, tp);
+         try visitOne(m, k, s, r, @intCast(v), m.s.h[cur], m.s.h[1 - cur]);
+         cur = 1 - cur;
+     }
+-    if (heads == 0 and !m.taps_on) return;
++    if (heads == 0 and (!m.taps_on or m.skip_final_taps)) return;
+     const plane = r.n * h * 2;
+     const nb = m.w.plan.final_sources - 1;
+-    var mix: ops.MixArgs = .{ .partial = m.s.h[cur], .query = m.w.output_query, .out = m.s.xf, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(r.n), .c = @intCast(h), .eps = t.eps };
+-    for (0..nb) |j| mix.blocks[j] = m.s.blocks + j * plane;
++    const tail0: usize = if (r.prompt) m.last_visit_tail0 else 0;
++    const tn = r.n - tail0;
++    var mix: ops.MixArgs = .{ .partial = m.s.h[cur] + tail0 * h * 2, .query = m.w.output_query, .out = m.s.xf + tail0 * h * 2, .n_blocks = @intCast(nb), .partial_bf16 = 1, .nq = 1, .rows = @intCast(tn), .c = @intCast(h), .eps = t.eps };
++    for (0..nb) |j| mix.blocks[j] = m.s.blocks + j * plane + tail0 * h * 2;
+     mix.norm[0] = m.w.norm;
+     try ops.mix(&k.ops, s, mix);
+     if (m.taps_on) try m.tap(k, s, m.s.xf, r.n, mm.tap_visits.len);
+@@ -220,8 +251,64 @@ fn visitOne(m: *Model, k: *const Kernels, s: cuda.Stream, r: *const Rows, v: u32
+     const xq = m.s.xin;
+     const xk = if (separate) m.s.xin + plane * 2 else xq;
+     const xv = if (separate) m.s.xin + 2 * plane * 2 else xq;
+-    // one row: the fused product (q, gate, rel, sink and k, v when they share the input), its parts read in place
+     var o: Out = .{ .q = m.s.q, .k = m.s.kraw, .v = m.s.vraw, .rel = m.s.rel, .gate = m.s.gate, .sink = m.s.sink };
++    // P1(b): on the last prompt visit, rows before last_visit_tail0 only write K/V; only the tail runs the full visit.
++    if (r.prompt and v == p.visits.len - 1 and m.last_visit_tail0 > 0 and global and !msgs and !spec.boundary) {
++        const tail0 = m.last_visit_tail0;
++        const tn = n - tail0;
++        const kvw = kvWidth(m);
++        const kvh: usize = t.local.kv;
++        const taps = kvh * config.conv_taps;
++        try proj(m, k, s, a.wk, xk, o.k, n);
++        try proj(m, k, s, a.wv, xv, o.v, n);
++        for ([_]u64{ xk, xv }, [_]u64{ a.k_taps, a.v_taps }, 0..) |x, w, side| {
++            try k.dense.rowsScaled(s, x, h, w, m.w.ones, m.s.dyn[side], taps, n, taps, h);
++        }
++        for ([_]Site{ .k, .v }, [_]u64{ o.k, o.v }, [_]u64{ m.s.kc, m.s.vc }, [_]u64{ a.k_conv, a.v_conv }, 0..) |site, x, out, w, side| {
++            try conv(m, k, s, r, v, site, .{ .x = x, .state = 0, .w = w, .dyn = m.s.dyn[side], .out = out, .x_bf16 = 1, .heads = @intCast(kvh), .c = @intCast(kvw), .rows = 0, .mode = 0 });
++        }
++        const l = m.full;
++        const all_rows: attn.Rows = .{ .rows = @intCast(n), .heads = t.local.q, .kv_heads = t.local.kv, .pos = m.s.pos, .seg_of = m.s.seg_of, .segs = m.s.segs[1], .tiles = m.s.tiles, .n_tiles = r.n_tiles, .last_pos = r.last_pos, .streams = @intCast(r.streams) };
++        const cache: attn.Cache = .{ .k = m.kv[0][v], .v = m.kv[1][v], .ks = m.kvs[0][v], .vs = m.kvs[1][v] };
++        const prep_cfg: attn.Prep = .{ .qk_clip = t.qk_clip, .rel_clip = t.rel_clip, .floor = @floatFromInt(t.log_floor), .alpha = t.log_alpha, .eps = t.eps };
++        try attn.prepKvOnly(&k.attn, s, all_rows, l, prep_cfg, m.s.kc, m.s.vc, cache);
++        // Tail slice [tail0, n): Q/rel/gate/sink, global attention, wo, attn_conv, mlp_mix, MoE, mlp_conv.
++        const xq_tail = xq + tail0 * h * 2;
++        if (tn > 1 and fusedRows()) {
++            const f = wts.Fused.of(t);
++            try proj(m, k, s, a.qx, xq_tail, m.s.fused, tn);
++            const qw: usize = @as(usize, t.local.q) * t.local.dim;
++            var sc: ops.SplitCols = .{ .n = 4 };
++            const parts = [4]struct { u64, usize, usize }{ .{ o.q, f.q, qw }, .{ o.gate, f.gate, qw }, .{ o.rel, f.rel, @as(usize, t.local.q) * t.d_rel }, .{ o.sink, f.sink, t.local.q } };
++            for (parts, 0..) |pt, pi| {
++                sc.dst[pi] = pt[0];
++                sc.off[pi] = @intCast(pt[1]);
++                sc.w[pi] = @intCast(pt[2]);
++            }
++            try ops.splitCols(&k.ops, s, m.s.fused, f.qx, tn, sc);
++        } else {
++            try proj(m, k, s, a.wq, xq_tail, o.q, tn);
++            try proj(m, k, s, a.wr, xq_tail, o.rel, tn);
++            try proj(m, k, s, a.gate, xq_tail, o.gate, tn);
++            try proj(m, k, s, a.sink, xq_tail, o.sink, tn);
++        }
++        const tr = try Rows.stageTail(m, s, r.prompt_slot, r.prompt_p0 + tail0, tn);
++        const tail_rows: attn.Rows = .{ .rows = @intCast(tn), .heads = t.local.q, .kv_heads = t.local.kv, .pos = m.s.pos, .seg_of = m.s.seg_of, .segs = m.s.segs[1], .tiles = m.s.tiles, .n_tiles = tr.n_tiles, .last_pos = tr.last_pos, .streams = 1 };
++        try attn.prepQOnly(&k.attn, s, tail_rows, l, prep_cfg, o.q, o.rel, .{ a.q_scale, a.rel_scale }, m.s.qp, m.s.relp, cache);
++        try attn.relTable(&k.attn, s, tail_rows, m.s.relp, a.rel_proj, m.s.tab);
++        const stride = attn.slotsFor(l, m.context);
++        try attn.attend(&k.attn, s, tail_rows, l, stride, m.s.entries, m.s.qp, cache, m.s.tab, m.s.part_o, m.s.part_ml, o.sink, o.gate, m.s.att);
++        try proj(m, k, s, a.wo, m.s.att, m.s.o, tn);
++        try conv(m, k, s, &tr, v, .attn, .{ .x = m.s.o, .state = 0, .w = L.attn_conv, .base = hin + tail0 * h * 2, .resid = m.s.h32, .x_bf16 = 1, .c = @intCast(h), .rows = 0, .mode = 1 });
++        var mix_m: ops.MixArgs = .{ .partial = m.s.h32, .query = L.mlp_query, .out = m.s.xm, .n_blocks = @intCast(spec.blocks_in), .partial_bf16 = 0, .nq = 1, .rows = @intCast(tn), .c = @intCast(h), .eps = t.eps };
++        for (0..spec.blocks_in) |j| mix_m.blocks[j] = m.s.blocks + j * plane * 2 + tail0 * h * 2;
++        mix_m.norm[0] = L.mlp_norm;
++        try ops.mix(&k.ops, s, mix_m);
++        try moe(m, k, s, &tr, L);
++        try conv(m, k, s, &tr, v, .mlp, .{ .x = m.s.moe, .state = 0, .w = L.mlp_conv, .resid = m.s.h32, .out = hout + tail0 * h * 2, .x_bf16 = 1, .c = @intCast(h), .rows = 0, .mode = 2 });
++        return;
++    }
++    // one row: the fused product (q, gate, rel, sink and k, v when they share the input), its parts read in place
+     if (n == 1) {
+         const f = wts.Fused.of(t);
+         const at = struct {
+-- 
+2.43.0
+
