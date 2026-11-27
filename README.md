@@ -21,18 +21,18 @@ Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 
 ## Performance
 
-Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on a single **NVIDIA RTX PRO 6000 Blackwell Workstation Edition** (`sm_120`, `Inkling-2-Mini`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1` DSpark, `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`). Decode numbers below are at **300 W** (Max-Q); prefill is shown at both **300 W** and **600 W**.
+Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on a single **NVIDIA RTX PRO 6000 Blackwell Workstation Edition** (`sm_120`, `Inkling-2-Mini`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`, `TF_INKLING2_ATTN_FP8_TC=1`). Prefill (patches `0001`–`0029`, DFlash2) is shown at both **300 W** and **600 W**; decode numbers below are from the earlier **300 W** (Max-Q) DSpark run.
 
-### Prefill (300 W vs 600 W)
+### Prefill (300 W vs 600 W · patches `0001`–`0029`)
 
 | Context | 300 W tok/s | 300 W TTFT | 600 W tok/s | 600 W TTFT |
 | --- | ---: | ---: | ---: | ---: |
-| 4k | **12,018.7 tok/s** | 392 ms | **19,478.4 tok/s** | 261 ms |
-| 8k | **11,340.5 tok/s** | 774 ms | **18,649.8 tok/s** | 491 ms |
-| 16k | **10,931.5 tok/s** | 1.55 s | **17,804.6 tok/s** | 971 ms |
-| 32k | **10,244.5 tok/s** | 3.25 s | **16,446.1 tok/s** | 2.04 s |
-| 64k | **9,023.8 tok/s** | 7.31 s | **14,307.1 tok/s** | 4.63 s |
-| 128k | **7,357.6 tok/s** | 17.87 s | **11,338.0 tok/s** | 11.61 s |
+| 4k | **14,987.4 tok/s** | 325 ms | **25,137.3 tok/s** | 214 ms |
+| 8k | **13,751.4 tok/s** | 647 ms | **22,466.3 tok/s** | 416 ms |
+| 16k | **13,082.8 tok/s** | 1.30 s | **21,399.3 tok/s** | 817 ms |
+| 32k | **12,356.0 tok/s** | 2.70 s | **20,353.2 tok/s** | 1.66 s |
+| 64k | **11,035.5 tok/s** | 5.99 s | **18,354.6 tok/s** | 3.62 s |
+| 128k | **9,133.2 tok/s** | 14.40 s | **15,197.5 tok/s** | 8.68 s |
 
 > **DFlash2:** the tables below were measured with the DSpark drafter. DFlash2 (now the default) hasn't been benchmarked on the RTX PRO 6000 yet. On a DGX Spark, with the same engine and settings and only the drafter changed, it decoded 13–37% faster at one stream and 20–25% faster at 4 and 8 streams (`temperature 0.7`, thinking on). See the [DGX Spark recipe](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold#performance).
 
