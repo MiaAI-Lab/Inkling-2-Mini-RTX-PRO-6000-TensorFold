@@ -21,7 +21,7 @@ Serve **[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 
 ## Performance
 
-Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on a single **NVIDIA RTX PRO 6000 Blackwell Workstation Edition** (`sm_120`, `Inkling-2-Mini`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`, `TF_INKLING2_ATTN_FP8_TC=1`). Prefill (patches `0001`–`0029`, DFlash2) is shown at both **300 W** and **600 W**; decode numbers below are from the earlier **300 W** (Max-Q) DSpark run.
+Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on a single **NVIDIA RTX PRO 6000 Blackwell Workstation Edition** (`sm_120`, `Inkling-2-Mini`, `CONTEXT=262144`, `PARALLEL=8`, `KV_DTYPE=fp8`, `DRAFTS=1` `DRAFTER=dflash2`, `TF_INKLING2_ATTN_FP8=1`, `TF_INKLING2_PREFILL_TC=1`, `TF_INKLING2_ATTN_FP8_TC=1`). Prefill (patches `0001`–`0029`) is shown at both **300 W** and **600 W**; decode below shows the new **DFlash2** prose run alongside the earlier **300 W** DSpark baseline.
 
 ### Prefill (300 W vs 600 W · patches `0001`–`0029`)
 
@@ -34,7 +34,14 @@ Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash/) on a single *
 | 64k | **11,035.5 tok/s** | 5.99 s | **18,354.6 tok/s** | 3.62 s |
 | 128k | **9,133.2 tok/s** | 14.40 s | **15,197.5 tok/s** | 8.68 s |
 
-> **DFlash2:** the tables below were measured with the DSpark drafter. DFlash2 (now the default) hasn't been benchmarked on the RTX PRO 6000 yet. On a DGX Spark, with the same engine and settings and only the drafter changed, it decoded 13–37% faster at one stream and 20–25% faster at 4 and 8 streams (`temperature 0.7`, thinking on). See the [DGX Spark recipe](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold#performance).
+### Decode — DFlash2 (Prose, `temp 0.7` · thinking on · `top_k 20` · patches `0001`–`0029`)
+
+| Streams | Prose agg | Prose / stream | TTFT |
+| --- | ---: | ---: | ---: |
+| ×1 | **230.1 tok/s** | 230.1 tok/s | 22 ms |
+| ×2 | **347.1 tok/s** | 174.4 tok/s | 94 ms |
+| ×4 | **448.1 tok/s** | 122.9 tok/s | 119 ms |
+| ×8 | **678.8 tok/s** | 90.4 tok/s | 229 ms |
 
 ### Decode — 300 W (`temp 0.7` · thinking on · `top_k 20` · DSpark drafts)
 
